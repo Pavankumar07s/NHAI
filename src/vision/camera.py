@@ -84,6 +84,10 @@ class CameraCapture:
 
             ok, frame = self._cap.read()
             if ok and frame is not None:
+                # Resize to target if camera delivers a different resolution
+                h, w = frame.shape[:2]
+                if w != self._width or h != self._height:
+                    frame = cv2.resize(frame, (self._width, self._height))
                 return frame
             logger.warning(f"Camera read failed (attempt {attempt}/{self._max_retries})")
 
@@ -106,15 +110,36 @@ class CameraCapture:
     # ------------------------------------------------------------------
 
     def _open(self) -> None:
-        """Open the camera, trying V4L2 first then GStreamer."""
+        """Open the camera, trying multiple backends in order.
+
+        Fallback order for integer indices:
+            1. Default (auto-detect) backend
+            2. Explicit device path ``/dev/videoN`` with V4L2
+            3. V4L2 by index
+            4. FFMPEG
+            5. GStreamer pipeline (Jetson CSI cameras)
+        """
         try:
             if isinstance(self._index, str):
-                # GStreamer pipeline
+                # GStreamer or explicit path
                 self._cap = cv2.VideoCapture(self._index, cv2.CAP_GSTREAMER)
-            else:
-                self._cap = cv2.VideoCapture(self._index, cv2.CAP_V4L2)
                 if not self._cap.isOpened():
-                    # Fallback: try GStreamer pipeline for Jetson CSI cameras
+                    self._cap = cv2.VideoCapture(self._index)
+            else:
+                # Strategy 1: auto-detect backend (works on most USB cameras)
+                self._cap = cv2.VideoCapture(self._index)
+                if not self._cap.isOpened():
+                    # Strategy 2: explicit /dev/videoN path with V4L2
+                    dev_path = f"/dev/video{self._index}"
+                    self._cap = cv2.VideoCapture(dev_path, cv2.CAP_V4L2)
+                if not self._cap.isOpened():
+                    # Strategy 3: V4L2 by index
+                    self._cap = cv2.VideoCapture(self._index, cv2.CAP_V4L2)
+                if not self._cap.isOpened():
+                    # Strategy 4: FFMPEG backend
+                    self._cap = cv2.VideoCapture(self._index, cv2.CAP_FFMPEG)
+                if not self._cap.isOpened():
+                    # Strategy 5: GStreamer pipeline for Jetson CSI cameras
                     gst = (
                         f"nvarguscamerasrc sensor-id={self._index} ! "
                         f"video/x-raw(memory:NVMM),width={self._width},"
@@ -129,9 +154,13 @@ class CameraCapture:
                 self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
                 self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
                 self._cap.set(cv2.CAP_PROP_FPS, self._fps)
+                # Read actual negotiated resolution
+                actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = int(self._cap.get(cv2.CAP_PROP_FPS))
                 logger.info(
                     f"Camera opened: index={self._index}, "
-                    f"{self._width}×{self._height}@{self._fps}fps"
+                    f"{actual_w}×{actual_h}@{actual_fps}fps"
                 )
             else:
                 logger.warning(f"Failed to open camera index={self._index}")

@@ -42,6 +42,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import (
     CAMERA_FPS,
     CAMERA_HEIGHT,
+    CAMERA_INDEX,
     CAMERA_WIDTH,
     CLASS_DISPLAY_NAMES,
     DASHBOARD_UPDATE_INTERVAL_S,
@@ -110,13 +111,15 @@ if "measurements" not in st.session_state:
 if "simulate" not in st.session_state:
     # Detect simulate mode from: CLI flag, env var, or missing camera device
     import os as _os
-    _has_camera = _os.path.exists("/dev/video0")
+    _camera_dev = f"/dev/video{CAMERA_INDEX}"
+    _has_camera = _os.path.exists(_camera_dev)
     _cli_simulate = "--simulate" in sys.argv
     _env_simulate = _os.environ.get("SIMULATE", "").lower() in ("1", "true", "yes")
     st.session_state.simulate = _cli_simulate or _env_simulate or not _has_camera
     logger.info(
-        "Mode auto-detected: simulate=%s (cli=%s, env=%s, camera=%s)",
-        st.session_state.simulate, _cli_simulate, _env_simulate, _has_camera,
+        "Mode auto-detected: simulate={} (cli={}, env={}, camera {} {})",
+        st.session_state.simulate, _cli_simulate, _env_simulate,
+        _camera_dev, "found" if _has_camera else "MISSING",
     )
 if "last_sim_time" not in st.session_state:
     st.session_state.last_sim_time = 0.0
