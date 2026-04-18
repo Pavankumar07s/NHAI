@@ -60,6 +60,21 @@ from src.vision.preprocessor import annotate_frame, extract_roi, normalize_for_m
 # ---------------------------------------------------------------------------
 
 @dataclass
+class DetectionDetail:
+    """Rich per-detection result with ROI crop and RL data."""
+
+    bbox: list
+    class_id: int
+    class_name: str
+    confidence: float
+    roi_crop: Optional[np.ndarray] = None
+    rl_raw: float = 0.0
+    rl_corrected: float = 0.0
+    qd: float = 0.0
+    status: str = "RED"
+
+
+@dataclass
 class SharedState:
     """Thread-safe shared state for the inference pipeline."""
 
@@ -67,6 +82,7 @@ class SharedState:
     annotated_frame: Optional[np.ndarray] = None
     detections: list = field(default_factory=list)
     rl_results: list = field(default_factory=list)
+    detection_details: List[DetectionDetail] = field(default_factory=list)
     sensor_data: dict = field(default_factory=dict)
     fps: float = 0.0
     gps: tuple = (0.0, 0.0)
@@ -84,11 +100,25 @@ class SharedState:
     def snapshot(self) -> dict:
         """Return a thread-safe copy of key fields."""
         with self._lock:
+            details_copy = []
+            for d in self.detection_details:
+                details_copy.append(DetectionDetail(
+                    bbox=list(d.bbox),
+                    class_id=d.class_id,
+                    class_name=d.class_name,
+                    confidence=d.confidence,
+                    roi_crop=d.roi_crop.copy() if d.roi_crop is not None else None,
+                    rl_raw=d.rl_raw,
+                    rl_corrected=d.rl_corrected,
+                    qd=d.qd,
+                    status=d.status,
+                ))
             return {
                 "latest_frame": self.latest_frame.copy() if self.latest_frame is not None else None,
                 "annotated_frame": self.annotated_frame.copy() if self.annotated_frame is not None else None,
                 "detections": list(self.detections),
                 "rl_results": list(self.rl_results),
+                "detection_details": details_copy,
                 "sensor_data": dict(self.sensor_data),
                 "fps": self.fps,
                 "gps": self.gps,
@@ -328,9 +358,9 @@ class InferenceThread(threading.Thread):
 
             try:
                 if self._simulate:
-                    detections, rl_results = self._simulate_inference(frame)
+                    detections, rl_results, details = self._simulate_inference(frame)
                 else:
-                    detections, rl_results = self._real_inference(frame)
+                    detections, rl_results, details = self._real_inference(frame)
 
                 fps = fps_counter.tick()
 
@@ -346,6 +376,7 @@ class InferenceThread(threading.Thread):
                     annotated_frame=annotated,
                     detections=detections,
                     rl_results=rl_results,
+                    detection_details=details,
                     fps=fps,
                     frame_count=self._state.frame_count + 1,
                 )
@@ -376,6 +407,7 @@ class InferenceThread(threading.Thread):
         """Run real YOLO + RL inference."""
         detections_raw = []
         rl_results = []
+        details = []
 
         if self._detector:
             dets = self._detector.detect(frame)
@@ -409,12 +441,25 @@ class InferenceThread(threading.Thread):
                 rl["status"] = status
                 rl_results.append(rl)
 
-        return detections_raw, rl_results
+                details.append(DetectionDetail(
+                    bbox=det.bbox,
+                    class_id=det.class_id,
+                    class_name=det.class_name,
+                    confidence=det.confidence,
+                    roi_crop=roi,
+                    rl_raw=rl["rl_raw"],
+                    rl_corrected=rl["rl_corrected"],
+                    qd=rl["qd"],
+                    status=status,
+                ))
+
+        return detections_raw, rl_results, details
 
     def _simulate_inference(self, frame: np.ndarray) -> tuple:
         """Generate synthetic detections and RL values for demo."""
         detections = []
         rl_results = []
+        details = []
         h, w = frame.shape[:2]
 
         num_dets = random.randint(1, 4)
@@ -425,12 +470,14 @@ class InferenceThread(threading.Thread):
             y1 = random.randint(50, h - 200)
             bw = random.randint(40, 180)
             bh = random.randint(30, 120)
+            bbox = [x1, y1, x1 + bw, y1 + bh]
+            conf = round(random.uniform(0.55, 0.98), 2)
 
             detections.append({
-                "bbox": [x1, y1, x1 + bw, y1 + bh],
+                "bbox": bbox,
                 "class_id": cls_id,
                 "class_name": cls_name,
-                "confidence": round(random.uniform(0.55, 0.98), 2),
+                "confidence": conf,
             })
 
             rl_val = round(random.gauss(280, 100), 1)
@@ -444,7 +491,20 @@ class InferenceThread(threading.Thread):
                 "status": status,
             })
 
-        return detections, rl_results
+            roi = extract_roi(frame, bbox)
+            details.append(DetectionDetail(
+                bbox=bbox,
+                class_id=cls_id,
+                class_name=cls_name,
+                confidence=conf,
+                roi_crop=roi,
+                rl_raw=rl_val,
+                rl_corrected=rl_val,
+                qd=qd,
+                status=status,
+            ))
+
+        return detections, rl_results, details
 
 
 # ---------------------------------------------------------------------------

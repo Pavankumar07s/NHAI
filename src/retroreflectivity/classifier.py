@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from config import CLASS_TO_IRC_KEY, IRC_THRESHOLDS
+from config import CLASS_TO_IRC_KEY, IRC_THRESHOLDS, ROAD_MARKING_CLASSES, ROAD_SIGN_CLASSES
 
 
 def classify_rl(rl_value: float, object_type: str) -> str:
@@ -106,4 +106,27 @@ def generate_summary_stats(measurements: List[Dict]) -> Dict:
         "min_rl": round(min(rl_vals), 2),
         "max_rl": round(max(rl_vals), 2),
         "compliance_pct": round(green / total * 100, 1) if total else 0.0,
+    }
+
+
+def generate_category_stats(measurements: List[Dict]) -> Dict[str, Dict]:
+    """Compute separate stats for road markings and road signs.
+
+    Parameters
+    ----------
+    measurements : List[Dict]
+        Each dict must have ``object_type``, ``rl_mcd``, and ``status`` keys.
+
+    Returns
+    -------
+    Dict[str, Dict]
+        Keys: ``markings``, ``signs`` — each containing the same fields as
+        :func:`generate_summary_stats`.
+    """
+    marking_meas = [m for m in measurements if m.get("object_type", "") in ROAD_MARKING_CLASSES]
+    sign_meas = [m for m in measurements if m.get("object_type", "") in ROAD_SIGN_CLASSES]
+
+    return {
+        "markings": generate_summary_stats(marking_meas),
+        "signs": generate_summary_stats(sign_meas),
     }

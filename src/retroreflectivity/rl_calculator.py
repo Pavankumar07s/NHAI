@@ -50,14 +50,17 @@ class _RLRegressorModel(nn.Module):
             self.backbone = EfficientNet.from_name("efficientnet-b0")
             backbone_out = 1280
         except ImportError:
-            # Fallback: simple CNN
-            logger.warning("efficientnet_pytorch not found — using fallback CNN backbone")
+            # Fallback: MobileNetV2 (must match train_rl_model.py architecture)
+            logger.warning("efficientnet_pytorch not found — using torchvision MobileNetV2")
+            from torchvision.models import mobilenet_v2
+
+            base = mobilenet_v2(weights=None)
             self.backbone = nn.Sequential(
-                nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(),
-                nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(),
-                nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+                base.features,
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
             )
-            backbone_out = 64
+            backbone_out = 1280
 
         self.head = nn.Sequential(
             nn.Linear(backbone_out + scalar_dim, hidden_dim),

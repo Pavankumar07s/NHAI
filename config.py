@@ -89,6 +89,39 @@ CLASS_TO_IRC_KEY: Dict[str, str] = {
     "delineator": "road_stud",
 }
 
+# Category grouping — road markings vs road signs
+ROAD_MARKING_CLASSES: set = {
+    "white_lane_marking",
+    "yellow_lane_marking",
+    "arrow_marking",
+    "road_stud",
+    "pedestrian_crossing",
+    "stop_line",
+    "delineator",
+}
+
+ROAD_SIGN_CLASSES: set = {
+    "traffic_sign_warning",
+    "traffic_sign_mandatory",
+    "traffic_sign_informatory",
+    "gantry_sign",
+}
+
+# Human-readable display names for classes
+CLASS_DISPLAY_NAMES: Dict[str, str] = {
+    "white_lane_marking": "White Lane Marking",
+    "yellow_lane_marking": "Yellow Lane Marking",
+    "arrow_marking": "Arrow Marking",
+    "road_stud": "Road Stud / RPM",
+    "pedestrian_crossing": "Pedestrian Crossing",
+    "stop_line": "Stop Line",
+    "traffic_sign_warning": "Warning Sign",
+    "traffic_sign_mandatory": "Mandatory Sign",
+    "traffic_sign_informatory": "Informatory Sign",
+    "gantry_sign": "Gantry Sign",
+    "delineator": "Delineator",
+}
+
 # ---------------------------------------------------------------------------
 # Camera Configuration
 # ---------------------------------------------------------------------------
@@ -172,9 +205,9 @@ class TrainConfig:
 
     # YOLO
     yolo_epochs: int = 50
-    yolo_batch: int = 16
+    yolo_batch: int = 4
     yolo_img_size: int = 640
-    yolo_base_model: str = "yolov8m.pt"
+    yolo_base_model: str = "yolov8s.pt"
 
     # RL Regressor
     rl_epochs: int = 50
