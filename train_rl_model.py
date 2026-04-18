@@ -37,6 +37,8 @@ from config import (
     RL_MODEL_PATH,
     RL_ONNX_PATH,
     RL_QD_LABELS_CSV,
+    RL_NORM_MIN,
+    RL_NORM_MAX,
     TrainConfig,
 )
 from src.utils.logger import logger
@@ -123,19 +125,26 @@ class RLDataset(Dataset):
         img = (img - mean) / std
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
 
-        # Scalar features
+        # Scalar features (normalised for stable training)
+        raw_dist = float(rec["simulated_distance"])
+        raw_tilt = float(rec["simulated_tilt"])
+        raw_hum = float(rec["simulated_humidity"])
         scalars = torch.tensor([
-            float(rec["simulated_distance"]),
-            float(rec["simulated_tilt"]),
-            25.0,  # temperature (simulated)
-            float(rec["simulated_humidity"]),
-            0.0,   # is_night
+            raw_dist / 5000.0,    # normalise distance to ~[0, 1]
+            raw_tilt / 10.0,      # normalise tilt to ~[0, 1]
+            25.0 / 50.0,          # normalise temperature
+            raw_hum / 100.0,      # normalise humidity
+            0.0,                  # is_night
         ], dtype=torch.float32)
 
-        # Targets
+        # Targets — normalise RL to [0, 1], Qd already in [0, 1]
+        rl_label = float(rec["rl_label"])
+        qd_label = float(rec["qd_label"])
+        rl_norm = (rl_label - RL_NORM_MIN) / (RL_NORM_MAX - RL_NORM_MIN)
+        rl_norm = max(0.0, min(1.0, rl_norm))
         targets = torch.tensor([
-            float(rec["rl_label"]),
-            float(rec["qd_label"]),
+            rl_norm,
+            qd_label,
         ], dtype=torch.float32)
 
         return img_tensor, scalars, targets
@@ -269,7 +278,7 @@ def train(
 
     # Model
     model = RLRegressorModel().to(device)
-    criterion = nn.HuberLoss(delta=1.0)
+    criterion = nn.HuberLoss(delta=0.1)  # tuned for normalised [0,1] targets
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -338,8 +347,9 @@ def train(
                 loss = criterion(preds, targets)
                 val_loss += loss.item()
 
-                # Per-metric errors
-                rl_err = (preds[:, 0] - targets[:, 0]).abs().cpu().numpy()
+                # Per-metric errors (denormalise RL for meaningful MAE)
+                rl_scale = RL_NORM_MAX - RL_NORM_MIN
+                rl_err = ((preds[:, 0] - targets[:, 0]) * rl_scale).abs().cpu().numpy()
                 qd_err = (preds[:, 1] - targets[:, 1]).abs().cpu().numpy()
                 rl_errors.extend(rl_err.tolist())
                 qd_errors.extend(qd_err.tolist())

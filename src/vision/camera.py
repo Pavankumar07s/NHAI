@@ -84,13 +84,18 @@ class CameraCapture:
 
             ok, frame = self._cap.read()
             if ok and frame is not None:
-                # Resize to target if camera delivers a different resolution
                 h, w = frame.shape[:2]
                 if w != self._width or h != self._height:
                     frame = cv2.resize(frame, (self._width, self._height))
                 return frame
-            logger.warning(f"Camera read failed (attempt {attempt}/{self._max_retries})")
 
+            # Brief pause before retry — helps USB cameras recover
+            if attempt < self._max_retries:
+                import time
+                time.sleep(0.02)
+
+        # Only log once per full failure (all retries exhausted)
+        logger.debug("Camera read: all {} attempts failed", self._max_retries)
         return None
 
     def release(self) -> None:
@@ -151,6 +156,8 @@ class CameraCapture:
                     self._cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
 
             if self._cap.isOpened():
+                # Minimise internal buffer to get freshest frames
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
                 self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
                 self._cap.set(cv2.CAP_PROP_FPS, self._fps)

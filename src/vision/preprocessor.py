@@ -141,7 +141,7 @@ def annotate_frame(
         x1, y1, x2, y2 = bbox
         cv2.rectangle(annotated, (x1, y1), (x2, y2), colour, 2)
 
-        label = f"{det.get('class_name', '')} RL:{rl_val:.0f} [{status}]"
+        label = f"{det.get('class_name', '')} RL:{rl_val:.0f} Qd:{qd_val:.2f} [{status}]"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), colour, -1)
         cv2.putText(

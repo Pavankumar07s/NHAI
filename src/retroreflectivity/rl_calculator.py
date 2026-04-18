@@ -27,6 +27,8 @@ from config import (
     WET_CORRECTION_DEFAULT,
     WET_CORRECTION_TABLE,
     VEHICLE_HEIGHT_CM,
+    RL_NORM_MIN,
+    RL_NORM_MAX,
     TrainConfig,
 )
 from src.retroreflectivity.geometry import calculate_angles, geometry_correction_factor
@@ -150,10 +152,10 @@ class RLCalculator:
         if self._model is not None:
             scalars = torch.tensor(
                 [
-                    scalar_inputs.get("distance_cm", 300.0),
-                    scalar_inputs.get("tilt_deg", 0.0),
-                    scalar_inputs.get("temperature_c", 25.0),
-                    scalar_inputs.get("humidity_pct", 50.0),
+                    scalar_inputs.get("distance_cm", 300.0) / 5000.0,
+                    scalar_inputs.get("tilt_deg", 0.0) / 10.0,
+                    scalar_inputs.get("temperature_c", 25.0) / 50.0,
+                    scalar_inputs.get("humidity_pct", 50.0) / 100.0,
                     scalar_inputs.get("is_night", 0.0),
                 ],
                 dtype=torch.float32,
@@ -162,8 +164,17 @@ class RLCalculator:
             roi_tensor = roi_tensor.to(self._device)
             with torch.no_grad():
                 preds = self._model(roi_tensor, scalars)
-            rl_raw = max(0.0, preds[0, 0].item())
+            # Denormalise RL: model outputs normalised [0,1] → mcd/m²/lx
+            rl_norm = preds[0, 0].item()
+            rl_raw = max(0.0, rl_norm * (RL_NORM_MAX - RL_NORM_MIN) + RL_NORM_MIN)
             qd = max(0.0, min(1.0, preds[0, 1].item()))
+
+            if rl_raw < 20.0:
+                logger.warning(
+                    "RL model output suspiciously low ({:.1f} mcd) — "
+                    "model may need retraining",
+                    rl_raw,
+                )
         else:
             # Simulated prediction (when model is missing)
             rl_raw = float(np.random.normal(300, 80))

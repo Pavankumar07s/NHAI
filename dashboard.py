@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-dashboard.py — Streamlit live dashboard for HighwayRetroAI.
+dashboard.py — HighwayRetroAI Streamlit Dashboard.
 
-Layout:
-    Sidebar:   Live sensor readings, model/sensor status, FPS, GPS
-    Left:      Live annotated camera feed (real or simulated)
-    Centre:    Per-object telemetry cards with ROI snapshot
-    Right:     Live Folium/Leaflet GPS map with coloured pins
-    Bottom:    Scrolling measurements table (last 50) + CSV export
-    Tabs:      Separate Road Markings vs Road Signs tracking
+Precision-instrument dark-theme panel:
+    TOP BAR  — HIGHWAYRETROAI brand, session timer, compliance %, FPS, status dots
+    ROW 1    — Camera feed (left) + per-object telemetry cards (right ~380px)
+    ROW 2    — Google Maps 3D satellite driving map, full width, 420px
+    ROW 3    — Measurements table, full width, last 50, filterable, CSV export
+    SIDEBAR  — Sensor readings with range bars, aggregate stats, session export
 
 Run:
     streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0
-    streamlit run dashboard.py -- --simulate      # demo mode (no hardware)
+    streamlit run dashboard.py -- --simulate
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from __future__ import annotations
 import base64
 import datetime
 import io
+import math
 import queue
 import random
 import sys
@@ -28,13 +28,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
-import folium
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit_folium import st_folium
+import streamlit.components.v1 as components
 
-# Ensure project root is on sys.path
+# Ensure project root on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -66,42 +65,199 @@ from src.utils.logger import logger
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="HighwayRetroAI — NHAI Hackathon",
-    page_icon="🛣️",
+    page_title="HighwayRetroAI",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for compact cards and status badges
-st.markdown("""
+# ---------------------------------------------------------------------------
+# CSS — Precision-instrument dark theme
+# ---------------------------------------------------------------------------
+
+_CSS = """
 <style>
-    .status-badge {
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 12px;
-        font-weight: 700;
-        font-size: 0.85em;
-        color: #fff;
-    }
-    .badge-green  { background-color: #22c55e; }
-    .badge-amber  { background-color: #f59e0b; }
-    .badge-red    { background-color: #ef4444; }
-    .metric-card {
-        background: #1e1e1e;
-        border-radius: 10px;
-        padding: 12px;
-        margin-bottom: 8px;
-        border-left: 4px solid #555;
-    }
-    .metric-card-green  { border-left-color: #22c55e; }
-    .metric-card-amber  { border-left-color: #f59e0b; }
-    .metric-card-red    { border-left-color: #ef4444; }
-    div[data-testid="stHorizontalBlock"] > div { padding: 0 4px; }
+/* ---- Palette ---- */
+:root {
+    --bg-primary:    #0a0c10;
+    --bg-surface:    #111318;
+    --bg-surface-2:  #15181f;
+    --border:        #1e2128;
+    --accent:        #3b82f6;
+    --green:         #22c55e;
+    --amber:         #f97316;
+    --red:           #ef4444;
+    --text-primary:  #f1f5f9;
+    --text-muted:    #6b7280;
+    --font-mono:     'IBM Plex Mono', 'Fira Code', 'Consolas', monospace;
+    --font-sans:     'DM Sans', 'Inter', -apple-system, sans-serif;
+}
+
+/* ---- Global ---- */
+.stApp { background: var(--bg-primary) !important; color: var(--text-primary) !important;
+         font-family: var(--font-sans) !important; }
+header[data-testid="stHeader"] { background: var(--bg-primary) !important; }
+section[data-testid="stSidebar"] {
+    background: #0c0e13 !important;
+    border-right: 1px solid var(--border) !important;
+}
+section[data-testid="stSidebar"] * { color: var(--text-primary) !important; }
+#MainMenu, footer, .stDeployButton { display: none !important; }
+hr { border-color: var(--border) !important; }
+
+/* ---- Top bar ---- */
+.topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    background: #070809; height: 48px; padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+    margin: -1rem -1rem 12px -1rem;
+}
+.topbar-brand {
+    font-family: var(--font-mono); font-size: 14px; font-weight: 700;
+    letter-spacing: 0.18em; color: var(--text-primary);
+}
+.topbar-center {
+    font-family: var(--font-mono); font-size: 13px; color: var(--text-muted);
+    letter-spacing: 0.04em;
+}
+.topbar-right {
+    display: flex; align-items: center; gap: 18px;
+    font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
+}
+.topbar-right .tv { color: var(--text-primary); font-weight: 600; }
+.topbar-divider { width: 1px; height: 18px; background: #2a2d36; }
+.status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 3px; vertical-align: middle;
+}
+.dot-ok   { background: var(--green); box-shadow: 0 0 4px var(--green); }
+.dot-warn { background: var(--amber); }
+.dot-off  { background: #3a3d45; }
+
+/* ---- Telemetry card ---- */
+.tcard {
+    background: var(--bg-surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 6px;
+    border-left: 4px solid var(--border);
+    display: flex; align-items: flex-start; gap: 10px;
+}
+.tcard-green  { border-left-color: var(--green); }
+.tcard-amber  { border-left-color: var(--amber); }
+.tcard-red    { border-left-color: var(--red); }
+.tcard .tcard-body { flex: 1; }
+.tcard .tcard-type {
+    font-family: var(--font-sans); font-size: 13px; color: var(--text-muted);
+    margin-bottom: 2px;
+}
+.tcard .tcard-rl {
+    font-family: var(--font-mono); font-size: 28px; font-weight: 700;
+    line-height: 1.1;
+}
+.tcard .tcard-qd {
+    font-family: var(--font-mono); font-size: 16px; color: var(--text-muted);
+    margin-top: 2px;
+}
+.tcard .tcard-status {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px;
+}
+.tcard .tcard-roi {
+    width: 80px; height: 60px; object-fit: cover;
+    border-radius: 4px; flex-shrink: 0; align-self: center;
+    border: 1px solid var(--border);
+}
+
+/* ---- Section label ---- */
+.slabel {
+    font-family: var(--font-mono); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.12em; color: var(--text-muted);
+    margin-bottom: 6px; padding-bottom: 3px;
+    border-bottom: 1px solid var(--border);
+}
+
+/* ---- Sidebar sensor ---- */
+.srow {
+    padding: 6px 0;
+    border-bottom: 1px solid #191c23;
+}
+.srow-label {
+    font-family: var(--font-mono); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--text-muted);
+}
+.srow-val {
+    font-family: var(--font-mono); font-size: 18px; font-weight: 600;
+    color: var(--text-primary); margin: 1px 0 3px 0;
+}
+.srow-bar {
+    width: 100%; height: 4px; background: #1e2128; border-radius: 2px;
+    overflow: hidden;
+}
+.srow-bar-fill {
+    height: 100%; border-radius: 2px;
+    transition: width 0.3s ease;
+}
+
+/* ---- Zebra table ---- */
+.ztable { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; }
+.ztable th {
+    text-align: left; padding: 6px 10px; font-size: 10px; text-transform: uppercase;
+    color: var(--text-muted); border-bottom: 1px solid var(--border);
+    letter-spacing: 0.06em; font-weight: 600;
+}
+.ztable td { padding: 5px 10px; border-bottom: 1px solid #14161c; }
+.ztable tr:nth-child(even) td { background: var(--bg-surface); }
+.ztable tr:nth-child(odd) td { background: var(--bg-primary); }
+.status-sq {
+    display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 6px; vertical-align: middle;
+}
+.sq-green  { background: var(--green); }
+.sq-amber  { background: var(--amber); }
+.sq-red    { background: var(--red); }
+
+/* ---- Metric cards ---- */
+div[data-testid="stMetric"] {
+    background: var(--bg-surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 14px;
+}
+div[data-testid="stMetric"] label {
+    color: var(--text-muted) !important; font-family: var(--font-mono) !important;
+    font-size: 10px !important; text-transform: uppercase; letter-spacing: 0.08em;
+}
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: var(--text-primary) !important; font-family: var(--font-mono) !important;
+    font-size: 1.3rem !important; font-weight: 600;
+}
+
+/* ---- Buttons ---- */
+.stButton > button {
+    background: var(--bg-surface) !important; color: var(--text-primary) !important;
+    border: 1px solid var(--border) !important; border-radius: 4px !important;
+    font-family: var(--font-mono) !important; font-size: 11px !important;
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
+.stButton > button:hover {
+    border-color: var(--accent) !important; background: var(--bg-surface-2) !important;
+}
+
+/* ---- Tabs ---- */
+.stTabs [data-baseweb="tab-list"] { background: var(--bg-surface) !important; border-radius: 6px 6px 0 0; }
+.stTabs [data-baseweb="tab"] { color: var(--text-muted) !important; font-family: var(--font-mono) !important; font-size: 11px !important; text-transform: uppercase; }
+.stTabs [aria-selected="true"] { color: var(--accent) !important; border-bottom-color: var(--accent) !important; }
+
+/* ---- Progress bar ---- */
+.stProgress > div > div > div { height: 6px !important; border-radius: 3px !important; }
+
+/* ---- Filter selectbox ---- */
+div[data-baseweb="select"] { font-family: var(--font-mono) !important; font-size: 12px !important; }
 </style>
-""", unsafe_allow_html=True)
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+"""
+
+st.markdown(_CSS, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Session state initialisation
+# Session state
 # ---------------------------------------------------------------------------
 
 if "exporter" not in st.session_state:
@@ -109,16 +265,15 @@ if "exporter" not in st.session_state:
 if "measurements" not in st.session_state:
     st.session_state.measurements = []
 if "simulate" not in st.session_state:
-    # Detect simulate mode from: CLI flag, env var, or missing camera device
     import os as _os
     _camera_dev = f"/dev/video{CAMERA_INDEX}"
     _has_camera = _os.path.exists(_camera_dev)
-    _cli_simulate = "--simulate" in sys.argv
-    _env_simulate = _os.environ.get("SIMULATE", "").lower() in ("1", "true", "yes")
-    st.session_state.simulate = _cli_simulate or _env_simulate or not _has_camera
+    _cli_sim = "--simulate" in sys.argv
+    _env_sim = _os.environ.get("SIMULATE", "").lower() in ("1", "true", "yes")
+    st.session_state.simulate = _cli_sim or _env_sim or not _has_camera
     logger.info(
         "Mode auto-detected: simulate={} (cli={}, env={}, camera {} {})",
-        st.session_state.simulate, _cli_simulate, _env_simulate,
+        st.session_state.simulate, _cli_sim, _env_sim,
         _camera_dev, "found" if _has_camera else "MISSING",
     )
 if "last_sim_time" not in st.session_state:
@@ -126,14 +281,17 @@ if "last_sim_time" not in st.session_state:
 if "gps_lat" not in st.session_state:
     st.session_state.gps_lat = 28.6139
     st.session_state.gps_lon = 77.2090
+if "gps_heading" not in st.session_state:
+    st.session_state.gps_heading = 45.0
 if "pipeline_running" not in st.session_state:
     st.session_state.pipeline_running = False
 if "pipeline_state" not in st.session_state:
     st.session_state.pipeline_state = None
-
+if "session_start" not in st.session_state:
+    st.session_state.session_start = time.time()
 
 # ---------------------------------------------------------------------------
-# Pipeline integration  (import inference pipeline threads)
+# Pipeline integration
 # ---------------------------------------------------------------------------
 
 def _get_pipeline():
@@ -147,26 +305,15 @@ def start_live_pipeline() -> None:
     """Start the inference pipeline threads for live webcam mode."""
     if st.session_state.get("pipeline_running"):
         return
-
-    from inference_pipeline import (
-        CameraThread,
-        InferenceThread,
-        SensorThread,
-        SharedState,
-    )
+    from inference_pipeline import CameraThread, InferenceThread, SensorThread, SharedState
     from config import SENSOR_POLL_HZ, USE_TRT
 
     shared = SharedState()
     fq: queue.Queue = queue.Queue(maxsize=2)
-
     sensor_t = SensorThread(shared, poll_hz=SENSOR_POLL_HZ, simulate=False)
     camera_t = CameraThread(shared, fq, simulate=False)
     infer_t = InferenceThread(shared, fq, simulate=False, use_trt=USE_TRT)
-
-    sensor_t.start()
-    camera_t.start()
-    infer_t.start()
-
+    sensor_t.start(); camera_t.start(); infer_t.start()
     st.session_state.pipe_shared = shared
     st.session_state.pipe_fq = fq
     st.session_state.pipe_threads = (sensor_t, camera_t, infer_t)
@@ -186,7 +333,7 @@ def stop_live_pipeline() -> None:
 
 
 def get_live_snapshot() -> Optional[dict]:
-    """Snapshot the live pipeline's shared state."""
+    """Snapshot the live pipeline shared state."""
     shared = _get_pipeline()
     if shared is None:
         return None
@@ -198,117 +345,85 @@ def get_live_snapshot() -> Optional[dict]:
         pass
     return None
 
-
 # ---------------------------------------------------------------------------
 # Simulation helpers
 # ---------------------------------------------------------------------------
 
 def generate_simulated_frame() -> np.ndarray:
-    """Generate a synthetic road scene image for demo (720x1280 BGR)."""
+    """Generate a synthetic road-scene image for demo (720x1280 BGR)."""
     frame = np.full((CAMERA_HEIGHT, CAMERA_WIDTH, 3), (60, 60, 60), dtype=np.uint8)
-
-    # Lane lines
     cv2.line(frame, (300, 0), (300, CAMERA_HEIGHT), (220, 220, 220), 4)
     cv2.line(frame, (980, 0), (980, CAMERA_HEIGHT), (220, 220, 220), 4)
     for y in range(0, CAMERA_HEIGHT, 60):
         cv2.line(frame, (640, y), (640, y + 30), (0, 200, 220), 3)
-
-    # Arrow markings
     if random.random() > 0.5:
         pts = np.array([[500, 500], [520, 450], [540, 500], [525, 500],
                         [525, 580], [515, 580], [515, 500]], np.int32)
         cv2.fillPoly(frame, [pts], (220, 220, 220))
-
-    # Simulated sign
     if random.random() > 0.6:
         x, y = random.randint(50, 200), random.randint(50, 200)
         cv2.rectangle(frame, (x, y), (x + 80, y + 80), (0, 0, 200), -1)
         cv2.rectangle(frame, (x, y), (x + 80, y + 80), (255, 255, 255), 2)
-
     noise = np.random.randint(0, 15, frame.shape, dtype=np.uint8)
     frame = cv2.add(frame, noise)
     return frame
 
 
 def simulate_detections_on_frame(frame: np.ndarray) -> List[dict]:
-    """Generate synthetic per-detection data and annotate frame for simulate mode.
-
-    Parameters
-    ----------
-    frame : np.ndarray
-        BGR frame to annotate in-place.
-
-    Returns
-    -------
-    List[dict]
-        Per-detection dicts with cls_name, confidence, rl, qd, status, roi_bgr.
-    """
+    """Generate synthetic per-detection data and annotate frame."""
     h, w = frame.shape[:2]
     dets = []
-    status_colors_bgr = {"GREEN": (0, 255, 0), "AMBER": (0, 165, 255), "RED": (0, 0, 255)}
-
+    status_bgr = {"GREEN": (0, 255, 0), "AMBER": (0, 165, 255), "RED": (0, 0, 255)}
     for _ in range(random.randint(1, 4)):
         cls_id = random.choice(list(UNIFIED_CLASSES.keys()))
         cls_name = UNIFIED_CLASSES[cls_id]
-        x1 = random.randint(50, w - 200)
-        y1 = random.randint(50, h - 200)
-        bw = random.randint(50, 160)
-        bh = random.randint(40, 110)
-        bbox = [x1, y1, x1 + bw, y1 + bh]
+        x1, y1 = random.randint(50, w - 200), random.randint(50, h - 200)
+        bw, bh = random.randint(50, 160), random.randint(40, 110)
         conf = round(random.uniform(0.55, 0.98), 2)
         rl = round(max(10, random.gauss(280, 110)), 1)
         qd = round(random.uniform(0.15, 0.85), 3)
         status = classify_rl(rl, cls_name)
 
-        # Draw on frame
-        color = status_colors_bgr.get(status, (255, 255, 255))
+        color = status_bgr.get(status, (255, 255, 255))
         cv2.rectangle(frame, (x1, y1), (x1 + bw, y1 + bh), color, 2)
         disp_name = CLASS_DISPLAY_NAMES.get(cls_name, cls_name)
-        label = f"{disp_name}  RL:{rl:.0f}  [{status}]"
+        label = f"{disp_name}  RL:{rl:.0f}  Qd:{qd:.2f}  [{status}]"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
         cv2.putText(frame, label, (x1 + 2, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Crop ROI
         roi = frame[max(0, y1):min(h, y1 + bh), max(0, x1):min(w, x1 + bw)]
         if roi.size == 0:
             roi = np.zeros((60, 80, 3), dtype=np.uint8)
-
         dets.append({
-            "cls_name": cls_name,
-            "confidence": conf,
-            "rl": rl,
-            "qd": qd,
-            "status": status,
-            "roi_bgr": roi.copy(),
+            "cls_name": cls_name, "confidence": conf, "rl": rl,
+            "qd": qd, "status": status, "roi_bgr": roi.copy(),
         })
     return dets
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _build_measurement(cls_name: str, rl: float, qd: float, status: str,
                        conf: float, lat: float, lon: float,
                        temp: float, hum: float, dist: float, tilt: float) -> dict:
-    """Build a measurement dict suitable for storage."""
+    """Build a measurement dict."""
     return {
         "timestamp": datetime.datetime.now().isoformat(),
-        "latitude": lat,
-        "longitude": lon,
+        "latitude": lat, "longitude": lon,
         "object_type": cls_name,
-        "rl_mcd": rl,
-        "qd_value": qd,
-        "status": status,
-        "confidence": conf,
-        "temperature_c": temp,
-        "humidity_pct": hum,
-        "distance_cm": dist,
-        "tilt_deg": tilt,
+        "rl_mcd": rl, "qd_value": qd,
+        "status": status, "confidence": conf,
+        "temperature_c": temp, "humidity_pct": hum,
+        "distance_cm": dist, "tilt_deg": tilt,
         "image_filename": "",
     }
 
 
-def _roi_to_base64(roi_bgr: Optional[np.ndarray], max_w: int = 120) -> str:
-    """Encode a BGR ROI to base64 PNG for HTML embedding."""
+def _roi_to_base64(roi_bgr: Optional[np.ndarray], max_w: int = 80) -> str:
+    """Encode BGR ROI to base64 PNG for HTML embedding."""
     if roi_bgr is None or roi_bgr.size == 0:
         return ""
     h, w = roi_bgr.shape[:2]
@@ -320,18 +435,339 @@ def _roi_to_base64(roi_bgr: Optional[np.ndarray], max_w: int = 120) -> str:
     return base64.b64encode(buf.tobytes()).decode()
 
 
-def _status_badge(status: str) -> str:
-    """Return HTML for a coloured status badge."""
-    css_cls = {"GREEN": "badge-green", "AMBER": "badge-amber", "RED": "badge-red"}.get(
-        status.upper(), "badge-red"
+def _status_color(status: str) -> str:
+    """Return CSS colour for a status string."""
+    return {"GREEN": "#22c55e", "AMBER": "#f97316", "RED": "#ef4444"}.get(
+        status.upper(), "#6b7280")
+
+
+def _compliance_label(status: str) -> str:
+    """Return a human-readable compliance label."""
+    return {"GREEN": "COMPLIANT", "AMBER": "MARGINAL", "RED": "NON-COMPLIANT"}.get(
+        status.upper(), "UNKNOWN")
+
+
+def _card_border_cls(status: str) -> str:
+    """Return CSS class for telemetry card border."""
+    return {"GREEN": "tcard-green", "AMBER": "tcard-amber",
+            "RED": "tcard-red"}.get(status.upper(), "")
+
+
+def _elapsed_str() -> str:
+    """Format elapsed session time as HH:MM:SS."""
+    elapsed = int(time.time() - st.session_state.session_start)
+    hrs, rem = divmod(elapsed, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Google Maps 3D satellite driving map
+# ---------------------------------------------------------------------------
+
+def _render_google_map(measurements: List[dict], center_lat: float,
+                       center_lon: float, heading: float,
+                       height: int = 420) -> None:
+    """Render a 3D satellite driving map via Google Maps JS API.
+
+    Features:
+        - Satellite view with 45-degree tilt (3D driving perspective)
+        - Heading locked to vehicle bearing
+        - Vehicle SVG marker at current position
+        - Coloured measurement pins (green/amber/red) with InfoWindow popups
+        - Smooth panTo animation on GPS updates
+
+    When no Google Maps API key is configured, falls back to Leaflet with
+    satellite tiles so the dashboard never breaks.
+
+    Parameters
+    ----------
+    measurements : List[dict]
+        Recent measurement dicts (last 200 used).
+    center_lat, center_lon : float
+        Current vehicle position.
+    heading : float
+        Vehicle heading in degrees (0 = north, clockwise).
+    height : int
+        Map height in pixels.
+    """
+    import os as _os
+    _gmaps_key = _os.environ.get("GOOGLE_MAPS_API_KEY", "YOUR_GOOGLE_MAPS_API_KEY")
+
+    pins = measurements[-200:]
+    markers_js_parts = []
+    for m in pins:
+        color = {"GREEN": "#22c55e", "AMBER": "#f97316", "RED": "#ef4444"}.get(
+            m.get("status", "RED"), "#888"
+        )
+        disp = CLASS_DISPLAY_NAMES.get(m.get("object_type", ""), m.get("object_type", ""))
+        # Escape quotes for JS string safety
+        popup_html = (
+            f'<div style="font-family:IBM Plex Mono,monospace;font-size:12px;'
+            f'color:#f1f5f9;min-width:180px;">'
+            f'<div style="font-size:14px;font-weight:700;margin-bottom:4px;">{disp}</div>'
+            f'<div style="color:#6b7280;margin-bottom:2px;">RL</div>'
+            f'<div style="font-size:20px;font-weight:700;color:{color};">'
+            f'{m.get("rl_mcd", 0):.0f} <span style="font-size:11px;color:#6b7280;">'
+            f'mcd/m\\u00b2/lx</span></div>'
+            f'<div style="color:#6b7280;margin-top:4px;">Qd: {m.get("qd_value", 0):.3f}</div>'
+            f'<div style="margin-top:6px;font-size:10px;font-weight:700;letter-spacing:0.06em;'
+            f'color:{color};">{_compliance_label(m.get("status", "RED"))}</div>'
+            f'<div style="color:#4b5563;font-size:10px;margin-top:4px;">'
+            f'{str(m.get("timestamp", ""))[:19]}</div>'
+            f'</div>'
+        ).replace("'", "\\'").replace("\n", "")
+        markers_js_parts.append(
+            f'{{lat:{m["latitude"]:.6f},lng:{m["longitude"]:.6f},'
+            f'color:"{color}",popup:\'{popup_html}\'}}'
+        )
+    markers_str = ",".join(markers_js_parts)
+
+    # Vehicle SVG icon as data URI
+    vehicle_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">'
+        '<circle cx="16" cy="16" r="14" fill="%233b82f6" stroke="%23fff" stroke-width="2"/>'
+        '<polygon points="16,6 22,22 16,18 10,22" fill="%23fff"/>'
+        '</svg>'
     )
-    return f'<span class="status-badge {css_cls}">{status}</span>'
+    vehicle_icon_url = f"data:image/svg+xml,{vehicle_svg}"
+
+    # Try Google Maps first, fallback to Leaflet satellite
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8"/>
+    <style>
+        body {{ margin:0; padding:0; background:#0a0c10; }}
+        #map {{ width:100%; height:{height}px; border-radius:6px;
+                border:1px solid #1e2128; }}
+        /* Google Maps InfoWindow overrides */
+        .gm-style-iw {{ background: #111318 !important; }}
+        .gm-style-iw-d {{ overflow: hidden !important; }}
+        .gm-ui-hover-effect {{ filter: invert(1); }}
+    </style>
+    </head>
+    <body>
+    <div id="map"></div>
+
+    <script>
+    // ---------------------------------------------------------------
+    // Google Maps API key — loaded from GOOGLE_MAPS_API_KEY in .env
+    // Get one at: https://console.cloud.google.com/google/maps-apis
+    // Enable "Maps JavaScript API" for the key.
+    // Falls back to Leaflet satellite if key is missing or invalid.
+    // ---------------------------------------------------------------
+    var GMAPS_API_KEY = '{_gmaps_key}';
+
+    var CENTER = {{ lat: {center_lat}, lng: {center_lon} }};
+    var HEADING = {heading};
+    var MARKERS = [{markers_str}];
+
+    function initGoogleMap() {{
+        var map = new google.maps.Map(document.getElementById('map'), {{
+            center: CENTER,
+            zoom: 18,
+            mapTypeId: 'satellite',
+            tilt: 45,
+            heading: HEADING,
+            disableDefaultUI: true,
+            zoomControl: true,
+            rotateControl: true,
+            gestureHandling: 'greedy',
+            styles: [{{ featureType: 'all', elementType: 'labels', stylers: [{{ visibility: 'on' }}] }}]
+        }});
+
+        // Measurement pins
+        MARKERS.forEach(function(m) {{
+            var marker = new google.maps.Marker({{
+                position: {{ lat: m.lat, lng: m.lng }},
+                map: map,
+                icon: {{
+                    path: google.maps.SymbolPath.CIRCLE,
+                    scale: 7,
+                    fillColor: m.color,
+                    fillOpacity: 0.9,
+                    strokeColor: '#fff',
+                    strokeWeight: 1,
+                }},
+            }});
+            var infoWindow = new google.maps.InfoWindow({{
+                content: '<div style="background:#111318;padding:8px;border-radius:4px;">' +
+                         m.popup + '</div>',
+            }});
+            marker.addListener('click', function() {{
+                infoWindow.open(map, marker);
+            }});
+        }});
+
+        // Vehicle marker
+        if (MARKERS.length > 0) {{
+            new google.maps.Marker({{
+                position: CENTER,
+                map: map,
+                icon: {{
+                    url: '{vehicle_icon_url}',
+                    scaledSize: new google.maps.Size(32, 32),
+                    anchor: new google.maps.Point(16, 16),
+                }},
+                zIndex: 9999,
+            }});
+        }}
+    }}
+
+    function initLeafletFallback() {{
+        // Fallback: Leaflet with satellite tiles (no API key required)
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        document.head.appendChild(link);
+
+        var script = document.createElement('script');
+        script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        script.onload = function() {{
+            var map = L.map('map', {{
+                center: [{center_lat}, {center_lon}],
+                zoom: 18,
+                zoomControl: true,
+                attributionControl: false
+            }});
+
+            // ESRI World Imagery (satellite, free, no key)
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+                maxZoom: 19,
+            }}).addTo(map);
+
+            // Measurement pins
+            MARKERS.forEach(function(m) {{
+                L.circleMarker([m.lat, m.lng], {{
+                    radius: 7,
+                    fillColor: m.color,
+                    color: '#fff',
+                    weight: 1,
+                    opacity: 0.9,
+                    fillOpacity: 0.85
+                }}).bindPopup(m.popup, {{
+                    className: 'dark-popup',
+                    maxWidth: 220
+                }}).addTo(map);
+            }});
+
+            // Vehicle marker
+            var vehicleIcon = L.divIcon({{
+                className: '',
+                html: '<div style="width:20px;height:20px;background:#3b82f6;' +
+                      'border:3px solid #fff;border-radius:50%;' +
+                      'box-shadow:0 0 12px #3b82f6;"></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+            }});
+            L.marker([{center_lat}, {center_lon}], {{ icon: vehicleIcon, zIndex: 9999 }}).addTo(map);
+        }};
+        document.head.appendChild(script);
+
+        // Inject dark popup styles
+        var popupStyle = document.createElement('style');
+        popupStyle.textContent = `
+            .dark-popup .leaflet-popup-content-wrapper {{
+                background: #111318 !important; color: #f1f5f9 !important;
+                border: 1px solid #1e2128 !important; border-radius: 6px !important;
+                font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+            }}
+            .dark-popup .leaflet-popup-tip {{ background: #111318 !important; }}
+        `;
+        document.head.appendChild(popupStyle);
+    }}
+
+    // Try loading Google Maps; fall back to Leaflet if key is placeholder or load fails
+    if (GMAPS_API_KEY && GMAPS_API_KEY !== 'YOUR_GOOGLE_MAPS_API_KEY') {{
+        var gscript = document.createElement('script');
+        gscript.src = 'https://maps.googleapis.com/maps/api/js?key=' + GMAPS_API_KEY + '&callback=initGoogleMap';
+        gscript.async = true;
+        gscript.defer = true;
+        gscript.onerror = function() {{
+            console.warn('Google Maps failed to load, falling back to Leaflet satellite.');
+            initLeafletFallback();
+        }};
+        document.head.appendChild(gscript);
+    }} else {{
+        initLeafletFallback();
+    }}
+    </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=height + 10, scrolling=False)
 
 
-def _card_css(status: str) -> str:
-    """Return CSS class for card border colour based on status."""
-    return {"GREEN": "metric-card-green", "AMBER": "metric-card-amber",
-            "RED": "metric-card-red"}.get(status.upper(), "")
+# ---------------------------------------------------------------------------
+# Custom HTML table renderer (dark zebra rows)
+# ---------------------------------------------------------------------------
+
+def _render_measurements_table(measurements: List[dict], max_rows: int = 50,
+                               type_filter: str = "All",
+                               status_filter: str = "All") -> None:
+    """Render a custom dark zebra-striped measurements table.
+
+    Parameters
+    ----------
+    measurements : List[dict]
+        Full measurement list.
+    max_rows : int
+        Restrict to last N.
+    type_filter, status_filter : str
+        Textual filters (``"All"`` for no filter).
+    """
+    filtered = measurements[:]
+    if type_filter != "All":
+        filtered = [m for m in filtered if m.get("object_type") == type_filter]
+    if status_filter != "All":
+        filtered = [m for m in filtered if m.get("status") == status_filter]
+
+    rows = filtered[-max_rows:][::-1]
+    if not rows:
+        st.markdown(
+            '<div style="color:#6b7280;font-family:var(--font-mono);'
+            'font-size:12px;padding:16px 0;text-align:center;">'
+            'No measurements match the current filter</div>',
+            unsafe_allow_html=True)
+        return
+
+    header = (
+        '<tr><th>Time</th><th>Type</th><th>RL mcd/m2/lx</th>'
+        '<th>Qd</th><th>Status</th><th>Conf</th>'
+        '<th>Lat</th><th>Lon</th></tr>'
+    )
+    tbody = []
+    for r in rows:
+        ts_short = str(r.get("timestamp", ""))[:19]
+        disp = CLASS_DISPLAY_NAMES.get(r.get("object_type", ""), r.get("object_type", ""))
+        status = r.get("status", "RED")
+        sq_cls = {"GREEN": "sq-green", "AMBER": "sq-amber", "RED": "sq-red"}.get(status, "sq-red")
+        comp_label = _compliance_label(status)
+        color = _status_color(status)
+        tbody.append(
+            f'<tr>'
+            f'<td>{ts_short}</td>'
+            f'<td>{disp}</td>'
+            f'<td style="color:{color};font-weight:600;">{r.get("rl_mcd", 0):.0f}</td>'
+            f'<td>{r.get("qd_value", 0):.3f}</td>'
+            f'<td><span class="status-sq {sq_cls}"></span>'
+            f'<span style="font-size:10px;letter-spacing:0.04em;color:{color};">'
+            f'{comp_label}</span></td>'
+            f'<td>{r.get("confidence", 0):.0%}</td>'
+            f'<td>{r.get("latitude", 0):.5f}</td>'
+            f'<td>{r.get("longitude", 0):.5f}</td>'
+            f'</tr>'
+        )
+
+    table_html = (
+        f'<div style="max-height:380px;overflow-y:auto;border:1px solid #1e2128;'
+        f'border-radius:6px;">'
+        f'<table class="ztable"><thead>{header}</thead>'
+        f'<tbody>{"".join(tbody)}</tbody></table></div>'
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -339,55 +775,41 @@ def _card_css(status: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Render the Streamlit dashboard."""
+    """Render the full HighwayRetroAI Streamlit dashboard."""
 
-    # ---- Header ----
-    col_title, col_mode, col_toggle = st.columns([5, 1, 1])
-    with col_title:
-        st.title("🛣️ HighwayRetroAI")
-        st.caption("NHAI 6th Innovation Hackathon — Real-time Retroreflectivity Measurement")
-    with col_mode:
-        mode = "SIMULATE" if st.session_state.simulate else "LIVE"
-        emoji = "🟡" if st.session_state.simulate else "🟢"
-        st.markdown(f"### {emoji} {mode}")
-    with col_toggle:
-        tog_label = "Switch to LIVE" if st.session_state.simulate else "Switch to SIM"
-        if st.button(tog_label, width="stretch"):
-            if not st.session_state.simulate:
-                stop_live_pipeline()
-            st.session_state.simulate = not st.session_state.simulate
-            st.rerun()
-
-    # ----------------------------------------------------------------
+    # ================================================================
     # Collect frame + detections  (simulate or live)
-    # ----------------------------------------------------------------
+    # ================================================================
     frame_bgr: Optional[np.ndarray] = None
     current_dets: List[dict] = []
     sensor_snap: dict = {}
     current_fps: float = 0.0
     gps_lat: float = st.session_state.gps_lat
     gps_lon: float = st.session_state.gps_lon
+    heading: float = st.session_state.gps_heading
+    num_markings: int = 0
+    num_signs: int = 0
 
     if st.session_state.simulate:
-        # ----- SIMULATE MODE -----
         now = time.time()
         frame_bgr = generate_simulated_frame()
         if now - st.session_state.last_sim_time > SIMULATE_MEASUREMENT_INTERVAL_S:
             current_dets = simulate_detections_on_frame(frame_bgr)
 
-            # HUD overlay
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cv2.putText(frame_bgr, f"HighwayRetroAI | {ts} | SIMULATE",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (255, 255, 255), 1, cv2.LINE_AA)
 
-            # Drift GPS to simulate vehicle movement
+            # Simulate GPS movement
             st.session_state.gps_lat += random.uniform(-0.0003, 0.0003)
             st.session_state.gps_lon += random.uniform(-0.0003, 0.0003)
+            st.session_state.gps_heading = (st.session_state.gps_heading
+                                            + random.uniform(-8, 8)) % 360
             gps_lat = st.session_state.gps_lat
             gps_lon = st.session_state.gps_lon
+            heading = st.session_state.gps_heading
 
-            # Simulated sensor data
             sensor_snap = {
                 "temperature_c": round(random.uniform(22, 38), 1),
                 "humidity_pct": round(random.uniform(30, 85), 1),
@@ -396,7 +818,6 @@ def main() -> None:
             }
             current_fps = round(random.uniform(25, 30), 1)
 
-            # Store measurements
             for d in current_dets:
                 m = _build_measurement(
                     d["cls_name"], d["rl"], d["qd"], d["status"], d["confidence"],
@@ -413,12 +834,10 @@ def main() -> None:
                     humidity_pct=m["humidity_pct"], distance_cm=m["distance_cm"],
                     tilt_deg=m["tilt_deg"],
                 )
-
             if len(st.session_state.measurements) > 500:
                 st.session_state.measurements = st.session_state.measurements[-500:]
             st.session_state.last_sim_time = now
         else:
-            # Between cycles — show frame without new detections
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cv2.putText(frame_bgr, f"HighwayRetroAI | {ts} | SIMULATE",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -428,12 +847,9 @@ def main() -> None:
                 "temperature_c": 30.0, "humidity_pct": 50.0,
                 "distance_cm": 300.0, "tilt_deg": 1.0,
             }
-
     else:
-        # ----- LIVE MODE -----
         if not st.session_state.pipeline_running:
             start_live_pipeline()
-
         snap = get_live_snapshot()
         if snap is not None:
             frame_bgr = snap["annotated_frame"]
@@ -441,19 +857,13 @@ def main() -> None:
             current_fps = snap.get("fps", 0.0)
             gps = snap.get("gps", (28.6139, 77.2090))
             gps_lat, gps_lon = gps[0], gps[1]
-
-            # Convert DetectionDetail objects to dicts for display
+            heading = sensor_snap.get("yaw_deg", st.session_state.gps_heading)
             for dd in snap.get("detection_details", []):
                 current_dets.append({
-                    "cls_name": dd.class_name,
-                    "confidence": dd.confidence,
-                    "rl": dd.rl_corrected,
-                    "qd": dd.qd,
-                    "status": dd.status,
-                    "roi_bgr": dd.roi_crop,
+                    "cls_name": dd.class_name, "confidence": dd.confidence,
+                    "rl": dd.rl_corrected, "qd": dd.qd,
+                    "status": dd.status, "roi_bgr": dd.roi_crop,
                 })
-
-            # Record measurements
             for d in current_dets:
                 m = _build_measurement(
                     d["cls_name"], d["rl"], d["qd"], d["status"], d["confidence"],
@@ -474,247 +884,364 @@ def main() -> None:
                     distance_cm=m["distance_cm"],
                     tilt_deg=m["tilt_deg"],
                 )
-
             if len(st.session_state.measurements) > 500:
                 st.session_state.measurements = st.session_state.measurements[-500:]
 
     measurements = st.session_state.measurements
 
-    # ================================================================
-    # ROW 1 — Camera Feed (left) | Telemetry Cards (centre) | Map (right)
-    # ================================================================
-    col_cam, col_cards, col_map = st.columns([4, 3, 3])
+    # Count categories for top bar
+    for d in current_dets:
+        if d["cls_name"] in ROAD_MARKING_CLASSES:
+            num_markings += 1
+        elif d["cls_name"] in ROAD_SIGN_CLASSES:
+            num_signs += 1
 
-    # ---- LEFT: Live annotated camera feed ----
+    # Compute compliance
+    summary = generate_summary_stats(measurements) if measurements else {
+        "total": 0, "green_count": 0, "amber_count": 0, "red_count": 0,
+        "avg_rl": 0.0, "compliance_pct": 0.0,
+    }
+    compliance_pct = summary["compliance_pct"] if measurements else 0.0
+
+    # Sensor status dots
+    import os
+    _cam_ok = os.path.exists(f"/dev/video{CAMERA_INDEX}") or st.session_state.simulate
+    _sens_ok = True  # Sensors always have fallback
+
+    # ================================================================
+    # TOP BAR
+    # ================================================================
+    st.markdown(
+        f'<div class="topbar">'
+        f'<div class="topbar-brand">HIGHWAYRETROAI</div>'
+        f'<div class="topbar-center">SESSION {_elapsed_str()}</div>'
+        f'<div class="topbar-right">'
+        f'<span>FPS <span class="tv">{current_fps:.1f}</span></span>'
+        f'<div class="topbar-divider"></div>'
+        f'<span>MARKINGS <span class="tv">{num_markings}</span></span>'
+        f'<div class="topbar-divider"></div>'
+        f'<span>SIGNS <span class="tv">{num_signs}</span></span>'
+        f'<div class="topbar-divider"></div>'
+        f'<span>COMPLIANCE <span class="tv">{compliance_pct:.0f}%</span></span>'
+        f'<div class="topbar-divider"></div>'
+        f'<span class="status-dot {"dot-ok" if _cam_ok else "dot-off"}" '
+        f'title="Camera"></span>'
+        f'<span class="status-dot {"dot-ok" if _sens_ok else "dot-warn"}" '
+        f'title="Sensors"></span>'
+        f'<span class="status-dot dot-ok" title="Models"></span>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Mode toggle (small)
+    col_spacer, col_toggle = st.columns([8, 2])
+    with col_toggle:
+        mode_label = "SIMULATE" if st.session_state.simulate else "LIVE"
+        tog_label = f"Mode: {mode_label} (switch)"
+        if st.button(tog_label, use_container_width=True, key="mode_toggle"):
+            if not st.session_state.simulate:
+                stop_live_pipeline()
+            st.session_state.simulate = not st.session_state.simulate
+            st.rerun()
+
+    # ================================================================
+    # ROW 1 — Camera Feed (left) | Telemetry Cards (right ~380px)
+    # ================================================================
+    col_cam, col_cards = st.columns([7, 3])
+
     with col_cam:
-        st.subheader("📹 Live Camera Feed")
+        st.markdown('<p class="slabel">Camera Feed</p>', unsafe_allow_html=True)
         if frame_bgr is not None:
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             st.image(frame_rgb, width="stretch")
         else:
-            st.info("No camera feed — waiting for frames…")
+            st.markdown(
+                '<div style="background:#111318;border:1px solid #1e2128;'
+                'border-radius:6px;padding:40px;text-align:center;'
+                'color:#6b7280;font-family:var(--font-mono);font-size:12px;">'
+                'Waiting for camera frames</div>', unsafe_allow_html=True)
 
-    # ---- CENTRE: Per-object telemetry cards ----
     with col_cards:
-        st.subheader("🔍 Per-Object Telemetry")
+        st.markdown('<p class="slabel">Detection Telemetry</p>', unsafe_allow_html=True)
         if current_dets:
-            for i, d in enumerate(current_dets[:6]):
+            for d in current_dets[:8]:
                 disp_name = CLASS_DISPLAY_NAMES.get(d["cls_name"], d["cls_name"])
-                badge = _status_badge(d["status"])
-                card_cls = _card_css(d["status"])
+                status = d["status"]
+                color = _status_color(status)
+                card_cls = _card_border_cls(status)
+                comp_label = _compliance_label(status)
                 roi_b64 = _roi_to_base64(d.get("roi_bgr"))
 
                 roi_html = ""
                 if roi_b64:
                     roi_html = (
                         f'<img src="data:image/png;base64,{roi_b64}" '
-                        f'style="max-height:60px;border-radius:4px;float:right;margin-left:8px"/>'
+                        f'class="tcard-roi"/>'
                     )
 
                 st.markdown(
-                    f'<div class="metric-card {card_cls}">'
+                    f'<div class="tcard {card_cls}">'
+                    f'<div class="tcard-body">'
+                    f'<div class="tcard-type">{disp_name}</div>'
+                    f'<div class="tcard-rl" style="color:{color};">'
+                    f'{d["rl"]:.0f} '
+                    f'<span style="font-size:12px;color:#6b7280;">mcd/m&sup2;/lx</span></div>'
+                    f'<div class="tcard-qd">Qd {d["qd"]:.3f}</div>'
+                    f'<div class="tcard-status" style="color:{color};">{comp_label}</div>'
+                    f'</div>'
                     f'{roi_html}'
-                    f'<strong>{disp_name}</strong> {badge}<br/>'
-                    f'RL: <b>{d["rl"]:.0f}</b> mcd/m²/lx &nbsp;|&nbsp; '
-                    f'Qd: <b>{d["qd"]:.3f}</b> &nbsp;|&nbsp; '
-                    f'Conf: <b>{d["confidence"]:.0%}</b>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
         else:
-            st.info("No detections in current frame")
-
-    # ---- RIGHT: Live GPS map ----
-    with col_map:
-        st.subheader("🗺️ GPS Map")
-        if measurements:
-            center_lat = measurements[-1]["latitude"]
-            center_lon = measurements[-1]["longitude"]
-            m_map = folium.Map(location=[center_lat, center_lon], zoom_start=16,
-                               tiles="OpenStreetMap")
-            color_map = {"GREEN": "green", "AMBER": "orange", "RED": "red"}
-
-            for meas in measurements[-100:]:
-                color = color_map.get(meas["status"], "gray")
-                disp = CLASS_DISPLAY_NAMES.get(meas["object_type"], meas["object_type"])
-                folium.CircleMarker(
-                    location=[meas["latitude"], meas["longitude"]],
-                    radius=6, color=color, fill=True,
-                    fill_color=color, fill_opacity=0.8,
-                    popup=(
-                        f"<b>{disp}</b><br>"
-                        f"RL: {meas['rl_mcd']:.0f} mcd/m²/lx<br>"
-                        f"Qd: {meas['qd_value']:.3f}<br>"
-                        f"Status: {meas['status']}<br>"
-                        f"{meas['timestamp'][:19]}"
-                    ),
-                ).add_to(m_map)
-            st_folium(m_map, width=None, height=340, returned_objects=[])
-        else:
-            st.info("No GPS data yet")
+            st.markdown(
+                '<div style="color:#6b7280;font-family:var(--font-mono);'
+                'font-size:12px;padding:20px 0;">No detections in current frame</div>',
+                unsafe_allow_html=True)
 
     # ================================================================
-    # ROW 2 — Road Markings track vs Road Signs track
+    # ROW 2 — GPS 3D Driving Map (full width, 420px)
     # ================================================================
-    st.divider()
-    tab_marks, tab_signs = st.tabs(["🛤️ Road Markings", "🪧 Road Signs"])
-
-    cat_stats = generate_category_stats(measurements) if measurements else {
-        "markings": generate_summary_stats([]),
-        "signs": generate_summary_stats([]),
-    }
-
-    with tab_marks:
-        ms = cat_stats["markings"]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Markings", ms["total"])
-        c2.metric("🟢 Green", ms["green_count"])
-        c3.metric("🟡 Amber", ms["amber_count"])
-        c4.metric("🔴 Red", ms["red_count"])
-        c5.metric("Avg RL", f"{ms['avg_rl']:.0f}" if ms["total"] else "—")
-        if ms["total"]:
-            st.progress(ms["compliance_pct"] / 100,
-                        text=f"Marking Compliance: {ms['compliance_pct']:.1f}%")
-        marks_meas = [m for m in measurements if m["object_type"] in ROAD_MARKING_CLASSES]
-        if marks_meas:
-            df_marks = pd.DataFrame(marks_meas[-20:][::-1])
-            cols_show = ["timestamp", "object_type", "rl_mcd", "qd_value", "status", "confidence"]
-            cols_show = [c for c in cols_show if c in df_marks.columns]
-            st.dataframe(df_marks[cols_show], use_container_width=True, hide_index=True)
-
-    with tab_signs:
-        ss = cat_stats["signs"]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Signs", ss["total"])
-        c2.metric("🟢 Green", ss["green_count"])
-        c3.metric("🟡 Amber", ss["amber_count"])
-        c4.metric("🔴 Red", ss["red_count"])
-        c5.metric("Avg RL", f"{ss['avg_rl']:.0f}" if ss["total"] else "—")
-        if ss["total"]:
-            st.progress(ss["compliance_pct"] / 100,
-                        text=f"Sign Compliance: {ss['compliance_pct']:.1f}%")
-        signs_meas = [m for m in measurements if m["object_type"] in ROAD_SIGN_CLASSES]
-        if signs_meas:
-            df_signs = pd.DataFrame(signs_meas[-20:][::-1])
-            cols_show = ["timestamp", "object_type", "rl_mcd", "qd_value", "status", "confidence"]
-            cols_show = [c for c in cols_show if c in df_signs.columns]
-            st.dataframe(df_signs[cols_show], use_container_width=True, hide_index=True)
-
-    # ================================================================
-    # ROW 3 — Scrolling measurements table (last 50) + actions
-    # ================================================================
-    st.divider()
-    st.subheader("📋 Recent Measurements (all)")
+    st.markdown('<p class="slabel" style="margin-top:14px;">GPS Driving Map</p>',
+                unsafe_allow_html=True)
     if measurements:
-        df_all = pd.DataFrame(measurements[-50:][::-1])
-        cols_pref = [
-            "timestamp", "latitude", "longitude", "object_type",
-            "rl_mcd", "qd_value", "status", "confidence",
-            "temperature_c", "humidity_pct", "distance_cm", "tilt_deg",
-        ]
-        cols_pref = [c for c in cols_pref if c in df_all.columns]
-        st.dataframe(df_all[cols_pref], use_container_width=True, hide_index=True, height=280)
+        _render_google_map(
+            measurements,
+            center_lat=gps_lat,
+            center_lon=gps_lon,
+            heading=heading,
+            height=420,
+        )
     else:
-        st.info("No measurements recorded yet")
-
-    # ---- Action buttons ----
-    btn1, btn2, btn3 = st.columns(3)
-    with btn1:
-        if st.button("📥 Export CSV", use_container_width=True):
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = OUTPUT_DIR / f"dashboard_export_{ts}.csv"
-            count = st.session_state.exporter.export(path)
-            st.success(f"Exported {count} records → {path.name}")
-    with btn2:
-        if st.button("🗑️ Clear History", use_container_width=True):
-            st.session_state.measurements = []
-            st.session_state.exporter.clear()
-            st.rerun()
-    with btn3:
-        if measurements:
-            df_export = pd.DataFrame(measurements)
-            csv_bytes = df_export.to_csv(index=False).encode()
-            st.download_button(
-                "⬇️ Download CSV",
-                data=csv_bytes,
-                file_name=f"highway_retro_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        st.markdown(
+            '<div style="background:#111318;border:1px solid #1e2128;'
+            'border-radius:6px;padding:40px;text-align:center;'
+            'color:#6b7280;font-family:var(--font-mono);font-size:12px;">'
+            'No GPS data yet -- measurements will appear as pins on the map'
+            '</div>', unsafe_allow_html=True)
 
     # ================================================================
-    # SIDEBAR — Sensor readings, status indicators
+    # ROW 3 — Measurements Table (full width, filterable)
+    # ================================================================
+    st.markdown('<p class="slabel" style="margin-top:14px;">Measurements</p>',
+                unsafe_allow_html=True)
+
+    # Filters
+    fc1, fc2, fc3, fc4 = st.columns([3, 2, 2, 3])
+    with fc1:
+        all_types = sorted({m["object_type"] for m in measurements}) if measurements else []
+        type_options = ["All"] + [CLASS_DISPLAY_NAMES.get(t, t) for t in all_types]
+        type_map = {"All": "All"}
+        for t in all_types:
+            type_map[CLASS_DISPLAY_NAMES.get(t, t)] = t
+        selected_type_display = st.selectbox(
+            "Type", type_options, index=0, key="filter_type", label_visibility="collapsed")
+        selected_type = type_map.get(selected_type_display, "All")
+    with fc2:
+        selected_status = st.selectbox(
+            "Status", ["All", "GREEN", "AMBER", "RED"], index=0,
+            key="filter_status", label_visibility="collapsed")
+    with fc4:
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            if st.button("Export CSV", use_container_width=True, key="export_csv"):
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = OUTPUT_DIR / f"dashboard_export_{ts_str}.csv"
+                count = st.session_state.exporter.export(path)
+                st.success(f"Exported {count} records to {path.name}")
+        with bc2:
+            if measurements:
+                df_exp = pd.DataFrame(measurements)
+                csv_bytes = df_exp.to_csv(index=False).encode()
+                st.download_button(
+                    "Download", data=csv_bytes,
+                    file_name=f"highway_retro_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+
+    _render_measurements_table(measurements, max_rows=50,
+                               type_filter=selected_type,
+                               status_filter=selected_status)
+
+    # ================================================================
+    # SIDEBAR
     # ================================================================
     with st.sidebar:
-        st.header("📡 System Status")
-        st.markdown("---")
+        st.markdown(
+            '<div style="font-family:var(--font-mono);font-size:12px;'
+            'letter-spacing:0.12em;color:#6b7280;margin-bottom:12px;">'
+            'SYSTEM MONITOR</div>',
+            unsafe_allow_html=True)
 
-        # Performance
-        st.markdown("**Performance**")
-        st.markdown(f"- FPS: **{current_fps:.1f}**")
-        st.markdown(f"- GPS: `{gps_lat:.6f}, {gps_lon:.6f}`")
+        # ---- Live Sensors with range bars ----
+        st.markdown('<p class="slabel">Live Sensors</p>', unsafe_allow_html=True)
+        temp = sensor_snap.get("temperature_c", 0.0)
+        hum = sensor_snap.get("humidity_pct", 0.0)
+        dist = sensor_snap.get("distance_cm", 0.0)
+        tilt = sensor_snap.get("tilt_deg", 0.0)
 
-        st.markdown("---")
-        st.markdown("**🌡️ Live Sensors**")
-        if sensor_snap:
-            s1, s2 = st.columns(2)
-            s1.metric("Temp", f"{sensor_snap.get('temperature_c', 0):.1f} °C")
-            s2.metric("Humidity", f"{sensor_snap.get('humidity_pct', 0):.1f} %")
-            s3, s4 = st.columns(2)
-            s3.metric("Distance", f"{sensor_snap.get('distance_cm', 0):.0f} cm")
-            s4.metric("Tilt", f"{sensor_snap.get('tilt_deg', 0):.2f}°")
-        else:
-            st.info("No sensor data")
+        sensor_items = [
+            ("TEMPERATURE", f"{temp:.1f} C", temp, 0, 50, "#3b82f6"),
+            ("HUMIDITY", f"{hum:.1f} %", hum, 0, 100, "#22c55e"),
+            ("DISTANCE", f"{dist:.0f} cm", dist, 0, 600, "#f97316"),
+            ("TILT", f"{tilt:.2f} deg", tilt, 0, 10, "#ef4444"),
+        ]
+        for lbl, val_str, val, vmin, vmax, bar_color in sensor_items:
+            pct = max(0, min(100, ((val - vmin) / (vmax - vmin)) * 100)) if vmax > vmin else 0
+            st.markdown(
+                f'<div class="srow">'
+                f'<div class="srow-label">{lbl}</div>'
+                f'<div class="srow-val">{val_str}</div>'
+                f'<div class="srow-bar">'
+                f'<div class="srow-bar-fill" style="width:{pct:.0f}%;background:{bar_color};"></div>'
+                f'</div></div>',
+                unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("**Models**")
+        # ---- GPS ----
+        st.markdown('<p class="slabel" style="margin-top:14px;">GPS</p>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="srow">'
+            f'<div class="srow-label">LATITUDE</div>'
+            f'<div class="srow-val" style="font-size:14px;">{gps_lat:.6f}</div></div>'
+            f'<div class="srow">'
+            f'<div class="srow-label">LONGITUDE</div>'
+            f'<div class="srow-val" style="font-size:14px;">{gps_lon:.6f}</div></div>'
+            f'<div class="srow">'
+            f'<div class="srow-label">HEADING</div>'
+            f'<div class="srow-val" style="font-size:14px;">{heading:.0f} deg</div></div>',
+            unsafe_allow_html=True)
+
+        # ---- Road Markings Stats ----
+        cat_stats = generate_category_stats(measurements) if measurements else {
+            "markings": generate_summary_stats([]),
+            "signs": generate_summary_stats([]),
+        }
+
+        st.markdown('<p class="slabel" style="margin-top:14px;">Road Markings</p>',
+                    unsafe_allow_html=True)
+        ms = cat_stats["markings"]
+        st.markdown(
+            f'<div class="srow">'
+            f'<div class="srow-label">TOTAL</div>'
+            f'<div class="srow-val">{ms["total"]}</div></div>'
+            f'<div class="srow">'
+            f'<div class="srow-label">AVG RL</div>'
+            f'<div class="srow-val">{ms["avg_rl"]:.0f} mcd</div></div>'
+            f'<div class="srow">'
+            f'<div class="srow-label">COMPLIANCE</div>'
+            f'<div class="srow-val">{ms["compliance_pct"]:.1f}%</div></div>',
+            unsafe_allow_html=True)
+        if ms["total"]:
+            _g, _a, _r = ms["green_count"], ms["amber_count"], ms["red_count"]
+            _total = _g + _a + _r
+            if _total > 0:
+                gw = _g / _total * 100
+                aw = _a / _total * 100
+                rw = _r / _total * 100
+                st.markdown(
+                    f'<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;'
+                    f'margin-top:4px;">'
+                    f'<div style="width:{gw:.0f}%;background:#22c55e;"></div>'
+                    f'<div style="width:{aw:.0f}%;background:#f97316;"></div>'
+                    f'<div style="width:{rw:.0f}%;background:#ef4444;"></div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
+        # ---- Road Signs Stats ----
+        st.markdown('<p class="slabel" style="margin-top:14px;">Road Signs</p>',
+                    unsafe_allow_html=True)
+        ss = cat_stats["signs"]
+        st.markdown(
+            f'<div class="srow">'
+            f'<div class="srow-label">TOTAL</div>'
+            f'<div class="srow-val">{ss["total"]}</div></div>'
+            f'<div class="srow">'
+            f'<div class="srow-label">AVG RL</div>'
+            f'<div class="srow-val">{ss["avg_rl"]:.0f} mcd</div></div>'
+            f'<div class="srow">'
+            f'<div class="srow-label">COMPLIANCE</div>'
+            f'<div class="srow-val">{ss["compliance_pct"]:.1f}%</div></div>',
+            unsafe_allow_html=True)
+        if ss["total"]:
+            _g, _a, _r = ss["green_count"], ss["amber_count"], ss["red_count"]
+            _total = _g + _a + _r
+            if _total > 0:
+                gw = _g / _total * 100
+                aw = _a / _total * 100
+                rw = _r / _total * 100
+                st.markdown(
+                    f'<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;'
+                    f'margin-top:4px;">'
+                    f'<div style="width:{gw:.0f}%;background:#22c55e;"></div>'
+                    f'<div style="width:{aw:.0f}%;background:#f97316;"></div>'
+                    f'<div style="width:{rw:.0f}%;background:#ef4444;"></div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
+        # ---- Models ----
+        st.markdown('<p class="slabel" style="margin-top:14px;">Models</p>',
+                    unsafe_allow_html=True)
         from config import YOLO_MODEL_PATH, RL_MODEL_PATH, YOLO_TRT_ENGINE, RL_TRT_ENGINE
-        yolo_ok = YOLO_MODEL_PATH.exists()
-        rl_ok = RL_MODEL_PATH.exists()
-        yolo_trt = YOLO_TRT_ENGINE.exists()
-        rl_trt = RL_TRT_ENGINE.exists()
-        st.markdown(f"- YOLO: {'✅ Loaded' if yolo_ok else '⚠️ Not found'}")
-        st.markdown(f"- RL Regressor: {'✅ Loaded' if rl_ok else '⚠️ Not found'}")
-        st.markdown(f"- YOLO TRT: {'✅' if yolo_trt else '—'}")
-        st.markdown(f"- RL TRT: {'✅' if rl_trt else '—'}")
+        models_info = [
+            ("YOLO", YOLO_MODEL_PATH.exists()),
+            ("RL REGRESSOR", RL_MODEL_PATH.exists()),
+            ("YOLO TRT", YOLO_TRT_ENGINE.exists()),
+            ("RL TRT", RL_TRT_ENGINE.exists()),
+        ]
+        for name, ok in models_info:
+            dot_cls = "dot-ok" if ok else "dot-off"
+            lbl = "Loaded" if ok else "N/A"
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;'
+                f'align-items:center;padding:2px 0;">'
+                f'<span style="font-family:var(--font-mono);font-size:11px;'
+                f'color:#6b7280;">{name}</span>'
+                f'<span><span class="status-dot {dot_cls}"></span>'
+                f'<span style="font-family:var(--font-mono);font-size:11px;'
+                f'color:{"#22c55e" if ok else "#6b7280"};">{lbl}</span></span>'
+                f'</div>',
+                unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("**Sensor Connections**")
-        if st.session_state.simulate:
-            st.markdown("- Camera: 🔄 Simulated")
-            st.markdown("- DHT11: 🔄 Simulated")
-            st.markdown("- IMU: 🔄 Simulated")
-            st.markdown("- Ultrasonic: 🔄 Simulated")
-            st.markdown("- GPS: 🔄 Simulated")
-        else:
-            import os
-            cam_ok = os.path.exists("/dev/video0")
-            st.markdown(f"- Camera: {'✅ /dev/video0' if cam_ok else '⚠️ Not found'}")
-            st.markdown("- DHT11: ⚠️ Fallback")
-            st.markdown("- IMU: ⚠️ Fallback")
-            st.markdown("- Ultrasonic: ⚠️ Fallback")
-            st.markdown("- GPS: 🔄 Simulated")
-
-        st.markdown("---")
-        st.markdown("**Session Stats**")
-        if measurements:
-            summary = generate_summary_stats(measurements)
-            st.markdown(f"- Total: **{summary['total']}**")
-            st.markdown(f"- Avg RL: **{summary['avg_rl']:.0f}** mcd/m²/lx")
-            st.markdown(f"- Compliance: **{summary['compliance_pct']:.1f}%**")
-
-        st.markdown("---")
-        st.markdown("**IRC:35-2015 Thresholds**")
+        # ---- IRC Thresholds ----
+        st.markdown('<p class="slabel" style="margin-top:14px;">IRC:35-2015 Thresholds</p>',
+                    unsafe_allow_html=True)
         for surface, thresh in IRC_THRESHOLDS.items():
-            st.markdown(f"- {surface}: 🟢≥{thresh['green']}  🟡≥{thresh['amber']}")
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;padding:2px 0;">'
+                f'<span style="font-family:var(--font-mono);font-size:10px;'
+                f'color:#6b7280;">{surface}</span>'
+                f'<span style="font-family:var(--font-mono);font-size:10px;'
+                f'color:#f1f5f9;">G&ge;{thresh["green"]}  A&ge;{thresh["amber"]}</span>'
+                f'</div>',
+                unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.caption("HighwayRetroAI v1.0 — NHAI 6th Hackathon")
+        # ---- Session actions ----
+        st.markdown('<p class="slabel" style="margin-top:14px;">Session</p>',
+                    unsafe_allow_html=True)
+        if st.button("Clear All History", use_container_width=True, key="sidebar_clear"):
+            st.session_state.measurements = []
+            st.session_state.exporter.clear()
+            st.session_state.session_start = time.time()
+            st.rerun()
+
+        if measurements:
+            df_sidebar = pd.DataFrame(measurements)
+            csv_sidebar = df_sidebar.to_csv(index=False).encode()
+            st.download_button(
+                "Export Session CSV", data=csv_sidebar,
+                file_name=f"session_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv",
+                mime="text/csv", use_container_width=True, key="sidebar_export",
+            )
+
+        st.markdown(
+            '<div style="margin-top:24px;color:#4b5563;font-family:var(--font-mono);'
+            'font-size:9px;text-align:center;letter-spacing:0.08em;">'
+            'HIGHWAYRETROAI v1.0</div>',
+            unsafe_allow_html=True)
 
     # ---- Auto-refresh ----
-    # NOTE: sleep must be short so the frontend receives rendered widgets quickly.
-    # The measurement-generation interval is gated by last_sim_time, not by sleep.
     refresh_rate = 0.3 if st.session_state.simulate else 0.5
     time.sleep(refresh_rate)
     st.rerun()

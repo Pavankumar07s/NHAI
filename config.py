@@ -152,6 +152,16 @@ DEFAULT_DISTANCE_CM = 300.0
 DEFAULT_TILT_DEG = 0.0
 
 # ---------------------------------------------------------------------------
+# RL Target Normalisation Constants
+# ---------------------------------------------------------------------------
+# During training, RL targets are normalised to [0, 1] via:
+#     rl_norm = (rl_raw - RL_NORM_MIN) / (RL_NORM_MAX - RL_NORM_MIN)
+# At inference, model output is denormalised:
+#     rl_mcd  = pred * (RL_NORM_MAX - RL_NORM_MIN) + RL_NORM_MIN
+RL_NORM_MIN = 0.0       # physical floor
+RL_NORM_MAX = 800.0     # cap (generous headroom over training max ≈732)
+
+# ---------------------------------------------------------------------------
 # Geometry Constants  (IRC:35-2015 — 30-metre standard)
 # ---------------------------------------------------------------------------
 OBSERVATION_ANGLE_DEG = 2.29        # degrees, at 30 m
