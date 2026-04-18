@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 13
+names: ['BUS LANE', 'Yellow Markings', 'Line 1', 'Line 2', 'Crossing', 'Romb', 'SLOW', 'Left Arrow', 'Forward Arrow', 'Forward Arrow -Left', 'Forward Arrow -Right', 'Right Arrow', 'Bicycle']
+
+roboflow:
+  workspace: lr-tdx
+  project: road-mark
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/lr-tdx/road-mark/dataset/3

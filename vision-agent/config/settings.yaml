@@ -1,0 +1,103 @@
+# ──────────────────────────────────────────────────────
+#  Vision-Agent — AI Orchestration Layer
+#  Subscribes to raw vision/health/smartguard events,
+#  applies LLM reasoning, produces high-level decisions.
+# ──────────────────────────────────────────────────────
+
+mqtt:
+  broker: "localhost"
+  port: 1883
+  username: "mqtt_user"
+  password: "Pavan@2005"
+  client_id: "vision-agent"
+  qos: 1
+  keepalive: 60
+
+  # Topics to SUBSCRIBE — raw events from all services
+  subscribe_topics:
+    # Vision service (per-camera events + movement data)
+    - "etms/vision/+/event"
+    - "etms/vision/+/movement"
+    - "etms/vision/+/person_count"
+    - "etms/vision/+/status"
+    # SmartGuard anomaly detection
+    - "etms/smartguard/anomaly"
+    - "etms/smartguard/status"
+    - "etms/smartguard/batch"
+    # Health sensors from phone companion app
+    - "etms/health/+/alert"
+    - "etms/floor/+/mobile/+/heart_rate"
+    - "etms/floor/+/mobile/+/hrv"
+    - "etms/floor/+/mobile/+/oxygen_saturation"
+
+  # Topic prefix for PUBLISH (high-level reasoned events)
+  publish_prefix: "etms/vision_agent"
+
+# LLM reasoning engine
+reasoning:
+  # Provider: "ollama" | "gemini" | "mock"
+  provider: "ollama"
+  model: "qwen2.5:3b"
+  # Fallback when LLM is unavailable
+  fallback_provider: "rule_based"
+  # Maximum tokens for reasoning response
+  max_tokens: 512
+  # Temperature (lower = more deterministic)
+  temperature: 0.3
+
+  # Ollama settings (used when provider=ollama)
+  ollama_base_url: "http://localhost:11434"
+  # Ollama request timeout in seconds
+  ollama_timeout: 30
+
+  # Gemini API key (used when provider=gemini, set via env var)
+  api_key_env: "GEMINI_API_KEY"
+
+  # Rate limiting to avoid overwhelming the model
+  max_calls_per_minute: 20
+  # Only invoke LLM when event severity >= this level
+  min_severity_for_llm: "low"
+  # Cooldown between LLM calls for the same event type (seconds)
+  dedup_window: 30
+
+# Context builder
+context:
+  # Sliding window: keep last N events for correlation
+  window_size: 50
+  # Time window for event correlation (seconds)
+  correlation_window: 300
+  # Maximum events to include in LLM prompt
+  max_events_in_prompt: 10
+  # Person history: how long to keep per-person context (seconds)
+  person_history_ttl: 1800
+
+# Decision scorer
+scoring:
+  # Multimodal fusion weights
+  weights:
+    vision_event: 0.35
+    smartguard_anomaly: 0.30
+    health_alert: 0.25
+    temporal_pattern: 0.10
+
+  # Severity thresholds (combined score 0.0–1.0)
+  thresholds:
+    low: 0.2
+    medium: 0.4
+    high: 0.6
+    critical: 0.8
+
+  # Escalation: require N confirmations before critical alert
+  critical_confirmations: 2
+  # Cool-down between escalations of same type (seconds)
+  escalation_cooldown: 120
+
+# Service behavior
+service:
+  # How often to publish status heartbeat (seconds)
+  heartbeat_interval: 30
+  # How often to run batch correlation analysis (seconds)
+  batch_interval: 60
+  # Log level: DEBUG | INFO | WARNING | ERROR
+  log_level: "INFO"
+  log_file: "logs/vision_agent.log"

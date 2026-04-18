@@ -1,0 +1,37 @@
+# HighwayRetroAI .gitignore
+
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Data / models (large binary)
+data/raw/
+data/processed/
+data/augmented/
+models/yolo/*.pt
+models/rl_regressor/*.pt
+models/rl_regressor/*.onnx
+models/trt/*.engine
+
+# Training artefacts
+runs/
+wandb/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+outputs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
