@@ -61,7 +61,35 @@ from src.vision.preprocessor import annotate_frame, extract_roi, normalize_for_m
 
 @dataclass
 class DetectionDetail:
-    """Rich per-detection result with ROI crop and RL data."""
+    """Rich per-detection result with ROI crop, RL data, and tracking info.
+
+    Attributes
+    ----------
+    bbox : list
+        [x1, y1, x2, y2] bounding box.
+    class_id : int
+        Unified class ID.
+    class_name : str
+        Unified class name.
+    confidence : float
+        YOLO confidence score.
+    roi_crop : np.ndarray | None
+        Cropped ROI image (BGR).
+    rl_raw : float
+        Raw RL prediction (mcd/m²/lx).
+    rl_corrected : float
+        RL after IoT corrections.
+    qd : float
+        Daytime luminance factor.
+    status : str
+        GREEN / AMBER / RED classification.
+    track_id : int
+        Unique tracking ID across frames (-1 = untracked).
+    lane_number : int
+        Inferred lane number (1-based, 0 = unknown).
+    consecutive_frames : int
+        Number of consecutive frames this object has been tracked.
+    """
 
     bbox: list
     class_id: int
@@ -72,6 +100,9 @@ class DetectionDetail:
     rl_corrected: float = 0.0
     qd: float = 0.0
     status: str = "RED"
+    track_id: int = -1
+    lane_number: int = 0
+    consecutive_frames: int = 1
 
 
 @dataclass
@@ -112,6 +143,9 @@ class SharedState:
                     rl_corrected=d.rl_corrected,
                     qd=d.qd,
                     status=d.status,
+                    track_id=d.track_id,
+                    lane_number=d.lane_number,
+                    consecutive_frames=d.consecutive_frames,
                 ))
             return {
                 "latest_frame": self.latest_frame.copy() if self.latest_frame is not None else None,
@@ -301,6 +335,130 @@ class CameraThread(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Centroid Tracker — simple IOU-based frame-to-frame matching
+# ---------------------------------------------------------------------------
+
+class _CentroidTracker:
+    """Lightweight frame-to-frame object tracker using IoU matching.
+
+    Assigns persistent ``track_id`` to detections across frames and
+    counts ``consecutive_frames`` for each tracked object.
+
+    Parameters
+    ----------
+    iou_threshold : float
+        Minimum IoU to match a detection to an existing track.
+    max_disappeared : int
+        Frames a track can be missing before removal.
+    """
+
+    def __init__(self, iou_threshold: float = 0.3, max_disappeared: int = 5) -> None:
+        self._next_id = 1
+        self._tracks: Dict[int, dict] = {}  # track_id → {bbox, class_name, frames, disappeared}
+        self._iou_thresh = iou_threshold
+        self._max_disappeared = max_disappeared
+
+    @staticmethod
+    def _iou(a: list, b: list) -> float:
+        """Compute Intersection-over-Union between two [x1,y1,x2,y2] boxes."""
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+        area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def update(self, detections: List[DetectionDetail]) -> List[DetectionDetail]:
+        """Match detections to existing tracks and assign track IDs.
+
+        Parameters
+        ----------
+        detections : List[DetectionDetail]
+            Current frame detections (will be mutated in-place).
+
+        Returns
+        -------
+        List[DetectionDetail]
+            Same list with track_id and consecutive_frames filled in.
+        """
+        # Mark all tracks as potentially disappeared this frame
+        for tid in self._tracks:
+            self._tracks[tid]["disappeared"] += 1
+
+        matched_tracks: set = set()
+        matched_dets: set = set()
+
+        # Greedy best-IoU matching
+        pairs = []
+        for di, det in enumerate(detections):
+            for tid, trk in self._tracks.items():
+                if det.class_name == trk["class_name"]:
+                    iou = self._iou(det.bbox, trk["bbox"])
+                    if iou >= self._iou_thresh:
+                        pairs.append((iou, di, tid))
+
+        pairs.sort(key=lambda x: x[0], reverse=True)
+        for iou_val, di, tid in pairs:
+            if di in matched_dets or tid in matched_tracks:
+                continue
+            # Assign existing track
+            detections[di].track_id = tid
+            self._tracks[tid]["bbox"] = detections[di].bbox
+            self._tracks[tid]["frames"] += 1
+            self._tracks[tid]["disappeared"] = 0
+            detections[di].consecutive_frames = self._tracks[tid]["frames"]
+            matched_tracks.add(tid)
+            matched_dets.add(di)
+
+        # Register new tracks for unmatched detections
+        for di, det in enumerate(detections):
+            if di not in matched_dets:
+                tid = self._next_id
+                self._next_id += 1
+                det.track_id = tid
+                det.consecutive_frames = 1
+                self._tracks[tid] = {
+                    "bbox": det.bbox,
+                    "class_name": det.class_name,
+                    "frames": 1,
+                    "disappeared": 0,
+                }
+
+        # Purge old tracks
+        dead = [tid for tid, trk in self._tracks.items()
+                if trk["disappeared"] > self._max_disappeared]
+        for tid in dead:
+            del self._tracks[tid]
+
+        return detections
+
+
+def _infer_lane(bbox: list, frame_width: int, num_lanes: int = 3) -> int:
+    """Infer lane number (1-based) from bbox center x-position.
+
+    Parameters
+    ----------
+    bbox : list
+        [x1, y1, x2, y2] bounding box.
+    frame_width : int
+        Width of the camera frame.
+    num_lanes : int
+        Number of lanes to divide frame into.
+
+    Returns
+    -------
+    int
+        Lane number (1 = leftmost, num_lanes = rightmost).
+    """
+    cx = (bbox[0] + bbox[2]) / 2.0
+    lane = int(cx / frame_width * num_lanes) + 1
+    return min(lane, num_lanes)
+
+
+# ---------------------------------------------------------------------------
 # Inference Thread
 # ---------------------------------------------------------------------------
 
@@ -332,6 +490,7 @@ class InferenceThread(threading.Thread):
         self._simulate = simulate
         self._detector = None
         self._rl_calc = None
+        self._tracker = _CentroidTracker(iou_threshold=0.3, max_disappeared=5)
 
         if not simulate:
             try:
@@ -361,6 +520,12 @@ class InferenceThread(threading.Thread):
                     detections, rl_results, details = self._simulate_inference(frame)
                 else:
                     detections, rl_results, details = self._real_inference(frame)
+
+                # Track objects across frames + infer lane numbers
+                h_frame, w_frame = frame.shape[:2]
+                for det in details:
+                    det.lane_number = _infer_lane(det.bbox, w_frame, num_lanes=3)
+                details = self._tracker.update(details)
 
                 fps = fps_counter.tick()
 

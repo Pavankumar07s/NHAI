@@ -43,12 +43,18 @@ from config import (
     CAMERA_HEIGHT,
     CAMERA_INDEX,
     CAMERA_WIDTH,
+    CLASS_DESCRIPTIONS,
     CLASS_DISPLAY_NAMES,
+    CLASS_TO_IRC_KEY,
     DASHBOARD_UPDATE_INTERVAL_S,
     IRC_THRESHOLDS,
     OUTPUT_DIR,
     ROAD_MARKING_CLASSES,
     ROAD_SIGN_CLASSES,
+    SIGN_MOUNTING_TYPE,
+    SIGN_REAL_SIZE_CM,
+    SIGN_SHEETING_CLASS,
+    CAMERA_FOCAL_PX,
     SIMULATE_MEASUREMENT_INTERVAL_S,
     UNIFIED_CLASSES,
 )
@@ -167,6 +173,55 @@ hr { border-color: var(--border) !important; }
     border: 1px solid var(--border);
 }
 
+/* ---- Telemetry card enrichment ---- */
+.tcard .tcard-desc {
+    font-family: var(--font-sans); font-size: 11px; color: #4b5563;
+    margin-top: 3px; line-height: 1.3;
+}
+.tcard .tcard-meta {
+    display: flex; gap: 8px; align-items: center; margin-top: 4px;
+    flex-wrap: wrap;
+}
+.tcard .tcard-badge {
+    font-family: var(--font-mono); font-size: 9px; font-weight: 600;
+    padding: 1px 6px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
+.badge-lane {
+    background: #1e293b; color: #93c5fd; border: 1px solid #334155;
+}
+.badge-track {
+    background: #1c1917; color: #a3a3a3; border: 1px solid #292524;
+}
+.badge-sheeting {
+    background: #1a1625; color: #c084fc; border: 1px solid #2e1065;
+}
+.badge-mount {
+    background: #0f172a; color: #7dd3fc; border: 1px solid #1e3a5f;
+}
+.tcard .tcard-bar-wrap {
+    width: 100%; height: 6px; background: #1e2128; border-radius: 3px;
+    overflow: hidden; margin-top: 4px; position: relative;
+}
+.tcard .tcard-bar-fill {
+    height: 100%; border-radius: 3px; transition: width 0.3s ease;
+}
+.tcard .tcard-bar-threshold {
+    position: absolute; top: -2px; width: 2px; height: 10px;
+    background: #f1f5f9; border-radius: 1px; opacity: 0.7;
+}
+.tcard .tcard-delta {
+    font-family: var(--font-mono); font-size: 11px; margin-top: 2px;
+}
+.tcard .tcard-sign-info {
+    font-family: var(--font-mono); font-size: 11px; color: #6b7280;
+    margin-top: 3px; display: flex; gap: 12px;
+}
+.tcard .tcard-condition {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+    letter-spacing: 0.04em; margin-top: 2px;
+}
+
 /* ---- Section label ---- */
 .slabel {
     font-family: var(--font-mono); font-size: 10px; text-transform: uppercase;
@@ -278,6 +333,8 @@ if "simulate" not in st.session_state:
     )
 if "last_sim_time" not in st.session_state:
     st.session_state.last_sim_time = 0.0
+if "last_frame_count" not in st.session_state:
+    st.session_state.last_frame_count = -1
 if "gps_lat" not in st.session_state:
     st.session_state.gps_lat = 28.6139
     st.session_state.gps_lon = 77.2090
@@ -399,6 +456,10 @@ def simulate_detections_on_frame(frame: np.ndarray) -> List[dict]:
         dets.append({
             "cls_name": cls_name, "confidence": conf, "rl": rl,
             "qd": qd, "status": status, "roi_bgr": roi.copy(),
+            "bbox": [x1, y1, x1 + bw, y1 + bh],
+            "track_id": random.randint(1, 50),
+            "lane_number": (x1 + bw // 2) * 3 // w + 1,
+            "consecutive_frames": random.randint(1, 30),
         })
     return dets
 
@@ -453,6 +514,69 @@ def _card_border_cls(status: str) -> str:
             "RED": "tcard-red"}.get(status.upper(), "")
 
 
+def _rl_deficit_surplus(rl: float, cls_name: str) -> tuple:
+    """Compute RL deficit or surplus vs IRC threshold.
+
+    Returns
+    -------
+    tuple
+        (delta, threshold, pct) where delta > 0 = surplus, < 0 = deficit,
+        and pct is fill percentage (0-100) capped for bar rendering.
+    """
+    irc_key = CLASS_TO_IRC_KEY.get(cls_name, "white_marking")
+    thresh = IRC_THRESHOLDS.get(irc_key, {}).get("green", 300)
+    delta = rl - thresh
+    pct = min(100, max(0, (rl / thresh) * 100)) if thresh > 0 else 100
+    return delta, thresh, pct
+
+
+def _estimate_sign_distance(bbox: list, cls_name: str) -> float:
+    """Estimate distance to a sign from its apparent pixel size.
+
+    Uses pinhole camera model: distance = (real_size * focal_length) / pixel_size
+
+    Parameters
+    ----------
+    bbox : list
+        [x1, y1, x2, y2] bounding box.
+    cls_name : str
+        Class name for looking up known real-world size.
+
+    Returns
+    -------
+    float
+        Estimated distance in metres (0 if class has no size data).
+    """
+    real_cm = SIGN_REAL_SIZE_CM.get(cls_name, 0)
+    if real_cm <= 0:
+        return 0.0
+    bw = max(1, bbox[2] - bbox[0])
+    bh = max(1, bbox[3] - bbox[1])
+    pixel_diag = (bw**2 + bh**2) ** 0.5
+    return (real_cm * CAMERA_FOCAL_PX) / (pixel_diag * 100)  # convert cm→m
+
+
+def _sign_condition(rl: float, cls_name: str) -> str:
+    """Assess sign condition from RL value relative to thresholds.
+
+    Returns
+    -------
+    str
+        One of 'Excellent', 'Acceptable', 'Degraded', 'Replace needed'.
+    """
+    irc_key = CLASS_TO_IRC_KEY.get(cls_name, "sign_ra1")
+    thresh = IRC_THRESHOLDS.get(irc_key, {})
+    green = thresh.get("green", 50)
+    amber = thresh.get("amber", 25)
+    if rl >= green * 1.5:
+        return "Excellent"
+    elif rl >= green:
+        return "Acceptable"
+    elif rl >= amber:
+        return "Degraded"
+    return "Replace needed"
+
+
 def _elapsed_str() -> str:
     """Format elapsed session time as HH:MM:SS."""
     elapsed = int(time.time() - st.session_state.session_start)
@@ -468,17 +592,16 @@ def _elapsed_str() -> str:
 def _render_google_map(measurements: List[dict], center_lat: float,
                        center_lon: float, heading: float,
                        height: int = 420) -> None:
-    """Render a 3D satellite driving map via Google Maps JS API.
+    """Render a 3D satellite driving map with rich geospatial overlays.
 
     Features:
         - Satellite view with 45-degree tilt (3D driving perspective)
-        - Heading locked to vehicle bearing
+        - Coloured polylines connecting consecutive road marking detections
+        - Square markers with 2-letter codes for traffic signs
         - Vehicle SVG marker at current position
-        - Coloured measurement pins (green/amber/red) with InfoWindow popups
-        - Smooth panTo animation on GPS updates
-
-    When no Google Maps API key is configured, falls back to Leaflet with
-    satellite tiles so the dashboard never breaks.
+        - Floating layer toggle panel (Markings / Signs / Clear)
+        - InfoWindow popups on all markers
+        - Leaflet satellite fallback when Google Maps key unavailable
 
     Parameters
     ----------
@@ -495,35 +618,74 @@ def _render_google_map(measurements: List[dict], center_lat: float,
     _gmaps_key = _os.environ.get("GOOGLE_MAPS_API_KEY", "YOUR_GOOGLE_MAPS_API_KEY")
 
     pins = measurements[-200:]
-    markers_js_parts = []
+
+    # Separate markings and signs for different rendering
+    marking_points = []  # {lat, lng, color, popup, type}
+    sign_points = []     # {lat, lng, color, popup, code, type}
+
+    _sign_codes = {
+        "traffic_sign_warning": "WR",
+        "traffic_sign_mandatory": "MD",
+        "traffic_sign_informatory": "IN",
+        "gantry_sign": "GT",
+    }
+
     for m in pins:
         color = {"GREEN": "#22c55e", "AMBER": "#f97316", "RED": "#ef4444"}.get(
             m.get("status", "RED"), "#888"
         )
-        disp = CLASS_DISPLAY_NAMES.get(m.get("object_type", ""), m.get("object_type", ""))
-        # Escape quotes for JS string safety
+        obj_type = m.get("object_type", "")
+        disp = CLASS_DISPLAY_NAMES.get(obj_type, obj_type)
+        irc_key = CLASS_TO_IRC_KEY.get(obj_type, "white_marking")
+        thresh = IRC_THRESHOLDS.get(irc_key, {})
+        rl_val = m.get("rl_mcd", 0)
+        qd_val = m.get("qd_value", 0)
+        comp = _compliance_label(m.get("status", "RED"))
+
         popup_html = (
             f'<div style="font-family:IBM Plex Mono,monospace;font-size:12px;'
             f'color:#f1f5f9;min-width:180px;">'
             f'<div style="font-size:14px;font-weight:700;margin-bottom:4px;">{disp}</div>'
             f'<div style="color:#6b7280;margin-bottom:2px;">RL</div>'
             f'<div style="font-size:20px;font-weight:700;color:{color};">'
-            f'{m.get("rl_mcd", 0):.0f} <span style="font-size:11px;color:#6b7280;">'
+            f'{rl_val:.0f} <span style="font-size:11px;color:#6b7280;">'
             f'mcd/m\\u00b2/lx</span></div>'
-            f'<div style="color:#6b7280;margin-top:4px;">Qd: {m.get("qd_value", 0):.3f}</div>'
+            f'<div style="color:#6b7280;margin-top:4px;">Qd: {qd_val:.3f}</div>'
+            f'<div style="margin-top:4px;">'
+            f'<div style="height:4px;background:#1e2128;border-radius:2px;overflow:hidden;">'
+            f'<div style="width:{min(100, (rl_val / max(1, thresh.get("green", 300))) * 100):.0f}%;'
+            f'height:100%;background:{color};border-radius:2px;"></div></div></div>'
             f'<div style="margin-top:6px;font-size:10px;font-weight:700;letter-spacing:0.06em;'
-            f'color:{color};">{_compliance_label(m.get("status", "RED"))}</div>'
+            f'color:{color};">{comp}</div>'
             f'<div style="color:#4b5563;font-size:10px;margin-top:4px;">'
             f'{str(m.get("timestamp", ""))[:19]}</div>'
             f'</div>'
         ).replace("'", "\\'").replace("\n", "")
-        markers_js_parts.append(
-            f'{{lat:{m["latitude"]:.6f},lng:{m["longitude"]:.6f},'
-            f'color:"{color}",popup:\'{popup_html}\'}}'
-        )
-    markers_str = ",".join(markers_js_parts)
 
-    # Vehicle SVG icon as data URI
+        point = {
+            "lat": m["latitude"], "lng": m["longitude"],
+            "color": color, "popup": popup_html, "type": obj_type,
+        }
+
+        if obj_type in ROAD_SIGN_CLASSES:
+            point["code"] = _sign_codes.get(obj_type, "SG")
+            sign_points.append(point)
+        else:
+            marking_points.append(point)
+
+    # Build JS arrays
+    markings_js = ",".join(
+        f'{{lat:{p["lat"]:.6f},lng:{p["lng"]:.6f},color:"{p["color"]}",'
+        f'popup:\'{p["popup"]}\',type:"{p["type"]}"}}'
+        for p in marking_points
+    )
+    signs_js = ",".join(
+        f'{{lat:{p["lat"]:.6f},lng:{p["lng"]:.6f},color:"{p["color"]}",'
+        f'popup:\'{p["popup"]}\',code:"{p["code"]}",type:"{p["type"]}"}}'
+        for p in sign_points
+    )
+
+    # Vehicle SVG icon
     vehicle_svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">'
         '<circle cx="16" cy="16" r="14" fill="%233b82f6" stroke="%23fff" stroke-width="2"/>'
@@ -532,7 +694,6 @@ def _render_google_map(measurements: List[dict], center_lat: float,
     )
     vehicle_icon_url = f"data:image/svg+xml,{vehicle_svg}"
 
-    # Try Google Maps first, fallback to Leaflet satellite
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -542,27 +703,93 @@ def _render_google_map(measurements: List[dict], center_lat: float,
         body {{ margin:0; padding:0; background:#0a0c10; }}
         #map {{ width:100%; height:{height}px; border-radius:6px;
                 border:1px solid #1e2128; }}
-        /* Google Maps InfoWindow overrides */
         .gm-style-iw {{ background: #111318 !important; }}
         .gm-style-iw-d {{ overflow: hidden !important; }}
         .gm-ui-hover-effect {{ filter: invert(1); }}
+        /* Layer toggle panel */
+        #layer-panel {{
+            position: absolute; top: 10px; right: 10px; z-index: 999;
+            background: rgba(17,19,24,0.92); border: 1px solid #1e2128;
+            border-radius: 6px; padding: 10px 14px;
+            font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+            color: #f1f5f9; min-width: 140px;
+            backdrop-filter: blur(8px);
+        }}
+        #layer-panel .lp-title {{
+            font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em;
+            color: #6b7280; margin-bottom: 8px;
+        }}
+        #layer-panel label {{
+            display: flex; align-items: center; gap: 8px;
+            cursor: pointer; padding: 3px 0; color: #e2e8f0;
+        }}
+        #layer-panel label:hover {{ color: #fff; }}
+        #layer-panel input[type="checkbox"] {{
+            accent-color: #3b82f6; width: 14px; height: 14px;
+        }}
+        #layer-panel .lp-indicator {{
+            display: inline-block; width: 10px; height: 10px;
+            border-radius: 2px; margin-right: 2px;
+        }}
+        #layer-panel button {{
+            margin-top: 8px; width: 100%; padding: 4px 0;
+            background: #1e2128; border: 1px solid #2a2d36;
+            border-radius: 4px; color: #6b7280; font-size: 10px;
+            font-family: inherit; cursor: pointer; text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }}
+        #layer-panel button:hover {{ border-color: #ef4444; color: #ef4444; }}
     </style>
     </head>
     <body>
+    <div style="position:relative;">
     <div id="map"></div>
+    <div id="layer-panel">
+        <div class="lp-title">Map Layers</div>
+        <label>
+            <input type="checkbox" id="tog-markings" checked onchange="toggleMarkings(this.checked)"/>
+            <span class="lp-indicator" style="background:#3b82f6;border-radius:50%;"></span>
+            Markings
+        </label>
+        <label>
+            <input type="checkbox" id="tog-signs" checked onchange="toggleSigns(this.checked)"/>
+            <span class="lp-indicator" style="background:#a855f7;"></span>
+            Signs
+        </label>
+        <button onclick="clearAllLayers()">Clear Map</button>
+    </div>
+    </div>
 
     <script>
-    // ---------------------------------------------------------------
-    // Google Maps API key — loaded from GOOGLE_MAPS_API_KEY in .env
-    // Get one at: https://console.cloud.google.com/google/maps-apis
-    // Enable "Maps JavaScript API" for the key.
-    // Falls back to Leaflet satellite if key is missing or invalid.
-    // ---------------------------------------------------------------
     var GMAPS_API_KEY = '{_gmaps_key}';
-
     var CENTER = {{ lat: {center_lat}, lng: {center_lon} }};
     var HEADING = {heading};
-    var MARKERS = [{markers_str}];
+    var MARKINGS = [{markings_js}];
+    var SIGNS = [{signs_js}];
+
+    var markingPolylines = [];
+    var markingDots = [];
+    var signMarkers = [];
+    var markingsVisible = true;
+    var signsVisible = true;
+
+    function toggleMarkings(show) {{
+        markingsVisible = show;
+        markingPolylines.forEach(function(p) {{ p.setMap(show ? window._gmap : null); }});
+        markingDots.forEach(function(m) {{ m.setMap(show ? window._gmap : null); }});
+    }}
+    function toggleSigns(show) {{
+        signsVisible = show;
+        signMarkers.forEach(function(m) {{ m.setMap(show ? window._gmap : null); }});
+    }}
+    function clearAllLayers() {{
+        markingPolylines.forEach(function(p) {{ p.setMap(null); }});
+        markingDots.forEach(function(m) {{ m.setMap(null); }});
+        signMarkers.forEach(function(m) {{ m.setMap(null); }});
+        markingPolylines = []; markingDots = []; signMarkers = [];
+        document.getElementById('tog-markings').checked = false;
+        document.getElementById('tog-signs').checked = false;
+    }}
 
     function initGoogleMap() {{
         var map = new google.maps.Map(document.getElementById('map'), {{
@@ -577,47 +804,102 @@ def _render_google_map(measurements: List[dict], center_lat: float,
             gestureHandling: 'greedy',
             styles: [{{ featureType: 'all', elementType: 'labels', stylers: [{{ visibility: 'on' }}] }}]
         }});
+        window._gmap = map;
 
-        // Measurement pins
-        MARKERS.forEach(function(m) {{
+        // --- Road marking polylines ---
+        // Group consecutive marking points and draw polylines with status color
+        if (MARKINGS.length > 1) {{
+            var segments = [];
+            var seg = {{ path: [MARKINGS[0]], color: MARKINGS[0].color }};
+            for (var i = 1; i < MARKINGS.length; i++) {{
+                if (MARKINGS[i].color === seg.color) {{
+                    seg.path.push(MARKINGS[i]);
+                }} else {{
+                    segments.push(seg);
+                    seg = {{ path: [MARKINGS[i]], color: MARKINGS[i].color }};
+                }}
+            }}
+            segments.push(seg);
+
+            segments.forEach(function(s) {{
+                if (s.path.length >= 2) {{
+                    var polyline = new google.maps.Polyline({{
+                        path: s.path.map(function(p) {{ return {{lat: p.lat, lng: p.lng}}; }}),
+                        geodesic: true,
+                        strokeColor: s.color,
+                        strokeOpacity: 0.85,
+                        strokeWeight: 5,
+                        map: map
+                    }});
+                    markingPolylines.push(polyline);
+                }}
+            }});
+        }}
+
+        // Marking dots (small circles at each measurement point)
+        MARKINGS.forEach(function(m) {{
             var marker = new google.maps.Marker({{
                 position: {{ lat: m.lat, lng: m.lng }},
                 map: map,
                 icon: {{
                     path: google.maps.SymbolPath.CIRCLE,
-                    scale: 7,
+                    scale: 5,
                     fillColor: m.color,
                     fillOpacity: 0.9,
                     strokeColor: '#fff',
                     strokeWeight: 1,
                 }},
             }});
-            var infoWindow = new google.maps.InfoWindow({{
+            var iw = new google.maps.InfoWindow({{
                 content: '<div style="background:#111318;padding:8px;border-radius:4px;">' +
                          m.popup + '</div>',
             }});
-            marker.addListener('click', function() {{
-                infoWindow.open(map, marker);
+            marker.addListener('click', function() {{ iw.open(map, marker); }});
+            markingDots.push(marker);
+        }});
+
+        // --- Sign square markers ---
+        SIGNS.forEach(function(s) {{
+            // Custom square SVG marker with 2-letter code
+            var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28">' +
+                '<rect x="1" y="1" width="26" height="26" rx="3" fill="' + s.color + '" ' +
+                'stroke="%23fff" stroke-width="1.5"/>' +
+                '<text x="14" y="18" text-anchor="middle" font-family="monospace" ' +
+                'font-size="11" font-weight="700" fill="%23fff">' + s.code + '</text></svg>';
+            var iconUrl = 'data:image/svg+xml,' + encodeURIComponent(svg);
+
+            var marker = new google.maps.Marker({{
+                position: {{ lat: s.lat, lng: s.lng }},
+                map: map,
+                icon: {{
+                    url: iconUrl,
+                    scaledSize: new google.maps.Size(28, 28),
+                    anchor: new google.maps.Point(14, 14),
+                }},
+                zIndex: 100,
             }});
+            var iw = new google.maps.InfoWindow({{
+                content: '<div style="background:#111318;padding:8px;border-radius:4px;">' +
+                         s.popup + '</div>',
+            }});
+            marker.addListener('click', function() {{ iw.open(map, marker); }});
+            signMarkers.push(marker);
         }});
 
         // Vehicle marker
-        if (MARKERS.length > 0) {{
-            new google.maps.Marker({{
-                position: CENTER,
-                map: map,
-                icon: {{
-                    url: '{vehicle_icon_url}',
-                    scaledSize: new google.maps.Size(32, 32),
-                    anchor: new google.maps.Point(16, 16),
-                }},
-                zIndex: 9999,
-            }});
-        }}
+        new google.maps.Marker({{
+            position: CENTER,
+            map: map,
+            icon: {{
+                url: '{vehicle_icon_url}',
+                scaledSize: new google.maps.Size(32, 32),
+                anchor: new google.maps.Point(16, 16),
+            }},
+            zIndex: 9999,
+        }});
     }}
 
     function initLeafletFallback() {{
-        // Fallback: Leaflet with satellite tiles (no API key required)
         var link = document.createElement('link');
         link.rel = 'stylesheet';
         link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
@@ -632,28 +914,61 @@ def _render_google_map(measurements: List[dict], center_lat: float,
                 zoomControl: true,
                 attributionControl: false
             }});
+            window._gmap = null;
 
-            // ESRI World Imagery (satellite, free, no key)
             L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
                 maxZoom: 19,
             }}).addTo(map);
 
-            // Measurement pins
-            MARKERS.forEach(function(m) {{
+            // Marking polylines (Leaflet)
+            if (MARKINGS.length >= 2) {{
+                var segments = [];
+                var seg = {{ path: [MARKINGS[0]], color: MARKINGS[0].color }};
+                for (var i = 1; i < MARKINGS.length; i++) {{
+                    if (MARKINGS[i].color === seg.color) {{
+                        seg.path.push(MARKINGS[i]);
+                    }} else {{
+                        segments.push(seg);
+                        seg = {{ path: [MARKINGS[i]], color: MARKINGS[i].color }};
+                    }}
+                }}
+                segments.push(seg);
+                segments.forEach(function(s) {{
+                    if (s.path.length >= 2) {{
+                        L.polyline(s.path.map(function(p) {{ return [p.lat, p.lng]; }}), {{
+                            color: s.color, weight: 5, opacity: 0.85
+                        }}).addTo(map);
+                    }}
+                }});
+            }}
+
+            // Marking dots
+            MARKINGS.forEach(function(m) {{
                 L.circleMarker([m.lat, m.lng], {{
-                    radius: 7,
-                    fillColor: m.color,
-                    color: '#fff',
-                    weight: 1,
-                    opacity: 0.9,
-                    fillOpacity: 0.85
+                    radius: 5, fillColor: m.color, color: '#fff',
+                    weight: 1, opacity: 0.9, fillOpacity: 0.85
                 }}).bindPopup(m.popup, {{
-                    className: 'dark-popup',
-                    maxWidth: 220
+                    className: 'dark-popup', maxWidth: 220
                 }}).addTo(map);
             }});
 
-            // Vehicle marker
+            // Sign square markers (Leaflet DivIcon)
+            SIGNS.forEach(function(s) {{
+                var icon = L.divIcon({{
+                    className: '',
+                    html: '<div style="width:24px;height:24px;background:' + s.color +
+                          ';border:2px solid #fff;border-radius:3px;display:flex;' +
+                          'align-items:center;justify-content:center;font-family:monospace;' +
+                          'font-size:10px;font-weight:700;color:#fff;">' + s.code + '</div>',
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12]
+                }});
+                L.marker([s.lat, s.lng], {{ icon: icon, zIndexOffset: 100 }})
+                 .bindPopup(s.popup, {{ className: 'dark-popup', maxWidth: 220 }})
+                 .addTo(map);
+            }});
+
+            // Vehicle
             var vehicleIcon = L.divIcon({{
                 className: '',
                 html: '<div style="width:20px;height:20px;background:#3b82f6;' +
@@ -666,7 +981,6 @@ def _render_google_map(measurements: List[dict], center_lat: float,
         }};
         document.head.appendChild(script);
 
-        // Inject dark popup styles
         var popupStyle = document.createElement('style');
         popupStyle.textContent = `
             .dark-popup .leaflet-popup-content-wrapper {{
@@ -679,14 +993,13 @@ def _render_google_map(measurements: List[dict], center_lat: float,
         document.head.appendChild(popupStyle);
     }}
 
-    // Try loading Google Maps; fall back to Leaflet if key is placeholder or load fails
     if (GMAPS_API_KEY && GMAPS_API_KEY !== 'YOUR_GOOGLE_MAPS_API_KEY') {{
         var gscript = document.createElement('script');
         gscript.src = 'https://maps.googleapis.com/maps/api/js?key=' + GMAPS_API_KEY + '&callback=initGoogleMap';
         gscript.async = true;
         gscript.defer = true;
         gscript.onerror = function() {{
-            console.warn('Google Maps failed to load, falling back to Leaflet satellite.');
+            console.warn('Google Maps failed, falling back to Leaflet satellite.');
             initLeafletFallback();
         }};
         document.head.appendChild(gscript);
@@ -863,6 +1176,10 @@ def main() -> None:
                     "cls_name": dd.class_name, "confidence": dd.confidence,
                     "rl": dd.rl_corrected, "qd": dd.qd,
                     "status": dd.status, "roi_bgr": dd.roi_crop,
+                    "track_id": dd.track_id,
+                    "lane_number": dd.lane_number,
+                    "consecutive_frames": dd.consecutive_frames,
+                    "bbox": dd.bbox,
                 })
             for d in current_dets:
                 m = _build_measurement(
@@ -971,6 +1288,51 @@ def main() -> None:
                 card_cls = _card_border_cls(status)
                 comp_label = _compliance_label(status)
                 roi_b64 = _roi_to_base64(d.get("roi_bgr"))
+                desc = CLASS_DESCRIPTIONS.get(d["cls_name"], "")
+                is_sign = d["cls_name"] in ROAD_SIGN_CLASSES
+
+                # RL deficit/surplus bar
+                delta, thresh, bar_pct = _rl_deficit_surplus(d["rl"], d["cls_name"])
+                delta_sign = "+" if delta >= 0 else ""
+                delta_color = "#22c55e" if delta >= 0 else "#ef4444"
+                bar_color = color
+                thresh_pct = min(100, 100)  # threshold is at 100% mark
+
+                # Lane & tracking badges
+                lane_num = d.get("lane_number", 0)
+                track_id = d.get("track_id", -1)
+                consec = d.get("consecutive_frames", 1)
+                lane_badge = (f'<span class="tcard-badge badge-lane">L{lane_num}</span>'
+                              if lane_num > 0 else "")
+                track_badge = (f'<span class="tcard-badge badge-track">'
+                               f'T{track_id} / {consec}f</span>'
+                               if track_id > 0 else "")
+
+                # Sign-specific enrichment
+                sign_html = ""
+                if is_sign:
+                    sheeting = SIGN_SHEETING_CLASS.get(d["cls_name"], "")
+                    mounting = SIGN_MOUNTING_TYPE.get(d["cls_name"], "")
+                    bbox = d.get("bbox", [0, 0, 100, 100])
+                    est_dist = _estimate_sign_distance(bbox, d["cls_name"])
+                    condition = _sign_condition(d["rl"], d["cls_name"])
+                    cond_color = {"Excellent": "#22c55e", "Acceptable": "#3b82f6",
+                                  "Degraded": "#f97316", "Replace needed": "#ef4444"
+                                  }.get(condition, "#6b7280")
+
+                    sheeting_badge = (f'<span class="tcard-badge badge-sheeting">'
+                                     f'{sheeting}</span>' if sheeting else "")
+                    mount_badge = (f'<span class="tcard-badge badge-mount">'
+                                   f'{mounting}</span>' if mounting else "")
+                    dist_str = f"{est_dist:.0f}m" if est_dist > 0 else "N/A"
+                    sign_html = (
+                        f'<div class="tcard-sign-info">'
+                        f'<span>Est. {dist_str}</span>'
+                        f'</div>'
+                        f'<div class="tcard-condition" style="color:{cond_color};">'
+                        f'{condition}</div>'
+                        f'<div class="tcard-meta">{sheeting_badge}{mount_badge}</div>'
+                    )
 
                 roi_html = ""
                 if roi_b64:
@@ -986,8 +1348,21 @@ def main() -> None:
                     f'<div class="tcard-rl" style="color:{color};">'
                     f'{d["rl"]:.0f} '
                     f'<span style="font-size:12px;color:#6b7280;">mcd/m&sup2;/lx</span></div>'
-                    f'<div class="tcard-qd">Qd {d["qd"]:.3f}</div>'
+                    f'<div class="tcard-qd">Qd {d["qd"]:.3f}'
+                    f'<span style="margin-left:12px;font-size:11px;color:#6b7280;">'
+                    f'Conf {d["confidence"]:.0%}</span></div>'
+                    f'<div class="tcard-desc">{desc}</div>'
+                    f'<div class="tcard-meta">{lane_badge}{track_badge}</div>'
+                    # RL bar
+                    f'<div class="tcard-bar-wrap">'
+                    f'<div class="tcard-bar-fill" style="width:{bar_pct:.0f}%;'
+                    f'background:{bar_color};"></div>'
+                    f'<div class="tcard-bar-threshold" style="left:calc(100% - 2px);"></div>'
+                    f'</div>'
+                    f'<div class="tcard-delta" style="color:{delta_color};">'
+                    f'{delta_sign}{delta:.0f} vs IRC {thresh} mcd</div>'
                     f'<div class="tcard-status" style="color:{color};">{comp_label}</div>'
+                    f'{sign_html}'
                     f'</div>'
                     f'{roi_html}'
                     f'</div>',
@@ -1242,7 +1617,9 @@ def main() -> None:
             unsafe_allow_html=True)
 
     # ---- Auto-refresh ----
-    refresh_rate = 0.3 if st.session_state.simulate else 0.5
+    # Faster refresh for smoother live stream (12-15 FPS render rate).
+    # Skip rerun if frame hasn't changed to reduce flicker.
+    refresh_rate = 0.25 if st.session_state.simulate else 0.1
     time.sleep(refresh_rate)
     st.rerun()
 

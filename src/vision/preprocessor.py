@@ -97,6 +97,77 @@ def _status_colour(status: str) -> Tuple[int, int, int]:
 
 
 # ------------------------------------------------------------------
+# Lane Overlay
+# ------------------------------------------------------------------
+
+
+def draw_lane_overlay(
+    frame: np.ndarray,
+    num_lanes: int = 3,
+    alpha: float = 0.15,
+) -> np.ndarray:
+    """Draw semi-transparent lane dividers and labels on the frame.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR frame (will be modified in-place).
+    num_lanes : int
+        Number of lanes to divide the frame width into.
+    alpha : float
+        Opacity of lane divider lines.
+
+    Returns
+    -------
+    np.ndarray
+        Frame with lane overlay drawn.
+    """
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    lane_w = w // num_lanes
+
+    # Vertical lane dividers (dashed lines)
+    for i in range(1, num_lanes):
+        x = i * lane_w
+        # Dashed line
+        dash_len = 20
+        gap_len = 15
+        y = 0
+        while y < h:
+            y_end = min(y + dash_len, h)
+            cv2.line(overlay, (x, y), (x, y_end), (200, 200, 200), 1, cv2.LINE_AA)
+            y += dash_len + gap_len
+
+    cv2.addWeighted(overlay, alpha * 2, frame, 1 - alpha * 2, 0, frame)
+
+    # Lane labels at bottom
+    label_y = h - 12
+    for i in range(num_lanes):
+        cx = i * lane_w + lane_w // 2
+        label = f"L{i + 1}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        # Background pill
+        cv2.rectangle(
+            frame,
+            (cx - tw // 2 - 6, label_y - th - 4),
+            (cx + tw // 2 + 6, label_y + 4),
+            (30, 30, 30), -1,
+        )
+        cv2.rectangle(
+            frame,
+            (cx - tw // 2 - 6, label_y - th - 4),
+            (cx + tw // 2 + 6, label_y + 4),
+            (120, 120, 120), 1,
+        )
+        cv2.putText(
+            frame, label, (cx - tw // 2, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA,
+        )
+
+    return frame
+
+
+# ------------------------------------------------------------------
 # Annotation
 # ------------------------------------------------------------------
 
@@ -130,6 +201,9 @@ def annotate_frame(
     """
     annotated = frame.copy()
     h, w = annotated.shape[:2]
+
+    # Draw lane overlay first (underneath detection boxes)
+    draw_lane_overlay(annotated, num_lanes=3, alpha=0.15)
 
     for det, rl in zip(detections, rl_results):
         bbox = det.get("bbox", [0, 0, 0, 0])

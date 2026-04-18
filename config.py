@@ -122,6 +122,47 @@ CLASS_DISPLAY_NAMES: Dict[str, str] = {
     "delineator": "Delineator",
 }
 
+# Plain-English contextual descriptions for each detection class
+CLASS_DESCRIPTIONS: Dict[str, str] = {
+    "white_lane_marking": "Longitudinal white lane boundary marking — defines traffic lane edges",
+    "yellow_lane_marking": "Yellow centre / no-overtaking marking — separates opposing traffic",
+    "arrow_marking": "Directional arrow marking — indicates permitted turning movements",
+    "road_stud": "Raised pavement marker (RPM / cat's eye) — provides tactile + reflective guidance",
+    "pedestrian_crossing": "Zebra / pedestrian crossing marking — delineates pedestrian right-of-way",
+    "stop_line": "Stop line marking — indicates mandatory stop position at junction",
+    "traffic_sign_warning": "Warning sign (W-series) — alerts drivers to upcoming hazards",
+    "traffic_sign_mandatory": "Mandatory sign (M-series) — prescribes required traffic actions",
+    "traffic_sign_informatory": "Informatory sign (I-series) — provides route/facility information",
+    "gantry_sign": "Overhead gantry sign — large multi-lane direction/speed indicator",
+    "delineator": "Roadside delineator — vertical reflective post for edge guidance",
+}
+
+# Sign-specific enrichment data
+SIGN_SHEETING_CLASS: Dict[str, str] = {
+    "traffic_sign_warning": "RA1",
+    "traffic_sign_mandatory": "RA2",
+    "traffic_sign_informatory": "RA1",
+    "gantry_sign": "RA2",
+}
+
+SIGN_MOUNTING_TYPE: Dict[str, str] = {
+    "traffic_sign_warning": "Post-mounted",
+    "traffic_sign_mandatory": "Post-mounted",
+    "traffic_sign_informatory": "Post-mounted",
+    "gantry_sign": "Gantry-mounted",
+}
+
+# Approximate real-world sign sizes (diagonal in cm) for distance estimation
+SIGN_REAL_SIZE_CM: Dict[str, float] = {
+    "traffic_sign_warning": 90.0,    # 60cm triangle ≈ 90cm diagonal
+    "traffic_sign_mandatory": 80.0,  # 60cm circle ≈ 80cm
+    "traffic_sign_informatory": 120.0,
+    "gantry_sign": 250.0,
+}
+
+# Camera focal length in pixels (estimated for C310 at 1280x720)
+CAMERA_FOCAL_PX: float = 920.0
+
 # ---------------------------------------------------------------------------
 # Camera Configuration
 # ---------------------------------------------------------------------------
