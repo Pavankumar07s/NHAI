@@ -198,6 +198,44 @@ streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0
 ```
 Then open `http://<jetson-ip>:8501` in a browser.
 
+### Enabling Smartphone GPS (optional)
+
+The dashboard can use **real GPS from a smartphone** via the browser's
+Geolocation API. When enabled, the smartphone continuously pushes its
+position to the map sidecar (`POST /api/gps`), replacing the simulated
+drift. All connected dashboard clients will see the live vehicle
+position update within 800 ms.
+
+**Requirements:**
+1. The smartphone must be on the **same LAN** as the Jetson / PC.
+2. Open the dashboard URL using the **LAN IP** (e.g. `http://192.168.1.42:8501`),
+   not `localhost`.
+3. **HTTPS is required** for `navigator.geolocation` on Chrome Android.
+   Two options:
+   - **Option A (recommended for dev):** On the phone, open
+     `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add
+     `http://192.168.1.42:8501`, and restart Chrome.
+   - **Option B (production):** Generate a local-CA certificate with
+     `mkcert` and configure Streamlit / a reverse proxy for HTTPS:
+     ```bash
+     mkcert -install
+     mkcert 192.168.1.42
+     # Then pass the certs via a reverse proxy (nginx/caddy) or
+     # streamlit config (~/.streamlit/config.toml):
+     #   [server]
+     #   sslCertFile = "./192.168.1.42.pem"
+     #   sslKeyFile  = "./192.168.1.42-key.pem"
+     ```
+4. The browser will prompt for location permission — grant it.
+5. GPS automatically falls back to **simulated** if no smartphone POST
+   arrives within 10 seconds.
+
+**Visual indicators:**
+- **Map (bottom-right):** `GPS LIVE ±Xm` (green) or `GPS SIMULATED` (amber).
+- **Top bar:** Same GPS source indicator next to the compliance badge.
+- **Vehicle marker:** Full opacity when using smartphone GPS; 50% opacity
+  when simulated.
+
 ---
 
 ## 8. Simulation Mode (No Hardware Required)

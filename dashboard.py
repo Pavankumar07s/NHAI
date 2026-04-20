@@ -65,6 +65,19 @@ from src.retroreflectivity.classifier import (
 )
 from src.utils.csv_exporter import MeasurementExporter
 from src.utils.logger import logger
+from map_server import (
+    start_map_server,
+    push_measurements as _push_map,
+    clear_map_state as _clear_map,
+    get_map_state as _get_map_state,
+    get_smartphone_gps as _get_smartphone_gps,
+    MAP_SERVER_PORT,
+)
+
+# ---------------------------------------------------------------------------
+# Start map sidecar server (once, idempotent)
+# ---------------------------------------------------------------------------
+start_map_server(MAP_SERVER_PORT)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -585,44 +598,445 @@ def _elapsed_str() -> str:
     return f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
 
+
 # ---------------------------------------------------------------------------
-# Google Maps 3D satellite driving map
+# Google Maps 3D satellite driving map  (render-once + poll architecture)
 # ---------------------------------------------------------------------------
 
-def _render_google_map(measurements: List[dict], center_lat: float,
-                       center_lon: float, heading: float,
-                       height: int = 420) -> None:
-    """Render a 3D satellite driving map with rich geospatial overlays.
+def _render_google_map_static(height: int = 420) -> None:
+    """Render the Google Maps iframe exactly once.
 
-    Features:
-        - Satellite view with 45-degree tilt (3D driving perspective)
-        - Coloured polylines connecting consecutive road marking detections
-        - Square markers with 2-letter codes for traffic signs
-        - Vehicle SVG marker at current position
-        - Floating layer toggle panel (Markings / Signs / Clear)
-        - InfoWindow popups on all markers
-        - Leaflet satellite fallback when Google Maps key unavailable
+    The iframe contains a JS ``setInterval`` loop that polls
+    ``GET /api/state`` on the FastAPI sidecar every 800 ms and
+    incrementally patches the live map — vehicle position, new
+    polylines, and new markers — without ever re-creating the iframe.
 
     Parameters
     ----------
-    measurements : List[dict]
-        Recent measurement dicts (last 200 used).
-    center_lat, center_lon : float
-        Current vehicle position.
-    heading : float
-        Vehicle heading in degrees (0 = north, clockwise).
     height : int
         Map height in pixels.
     """
     import os as _os
     _gmaps_key = _os.environ.get("GOOGLE_MAPS_API_KEY", "YOUR_GOOGLE_MAPS_API_KEY")
+    # Use window.location.hostname so smartphones on the LAN can reach the
+    # sidecar — falls back to 127.0.0.1 if the page is opened locally.
+    # The actual api_base is computed in JS (see API_BASE variable below).
+    api_base_py = f"http://127.0.0.1:{MAP_SERVER_PORT}"  # only for Leaflet fallback init
 
-    pins = measurements[-200:]
+    # Vehicle SVG icon
+    vehicle_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">'
+        '<circle cx="16" cy="16" r="14" fill="%233b82f6" stroke="%23fff" stroke-width="2"/>'
+        '<polygon points="16,6 22,22 16,18 10,22" fill="%23fff"/>'
+        '</svg>'
+    )
+    vehicle_icon_url = f"data:image/svg+xml,{vehicle_svg}"
 
-    # Separate markings and signs for different rendering
-    marking_points = []  # {lat, lng, color, popup, type}
-    sign_points = []     # {lat, lng, color, popup, code, type}
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8"/>
+    <style>
+        body {{ margin:0; padding:0; background:#0a0c10; }}
+        #map {{ width:100%; height:{height}px; border-radius:6px;
+                border:1px solid #1e2128; }}
+        .gm-style-iw {{ background: #111318 !important; }}
+        .gm-style-iw-d {{ overflow: hidden !important; }}
+        .gm-ui-hover-effect {{ filter: invert(1); }}
+        #layer-panel {{
+            position: absolute; top: 10px; right: 10px; z-index: 999;
+            background: rgba(17,19,24,0.92); border: 1px solid #1e2128;
+            border-radius: 6px; padding: 10px 14px;
+            font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+            color: #f1f5f9; min-width: 140px;
+            backdrop-filter: blur(8px);
+        }}
+        #layer-panel .lp-title {{
+            font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em;
+            color: #6b7280; margin-bottom: 8px;
+        }}
+        #layer-panel label {{
+            display: flex; align-items: center; gap: 8px;
+            cursor: pointer; padding: 3px 0; color: #e2e8f0;
+        }}
+        #layer-panel label:hover {{ color: #fff; }}
+        #layer-panel input[type="checkbox"] {{
+            accent-color: #3b82f6; width: 14px; height: 14px;
+        }}
+        #layer-panel .lp-indicator {{
+            display: inline-block; width: 10px; height: 10px;
+            border-radius: 2px; margin-right: 2px;
+        }}
+        #layer-panel button {{
+            margin-top: 8px; width: 100%; padding: 4px 0;
+            background: #1e2128; border: 1px solid #2a2d36;
+            border-radius: 4px; color: #6b7280; font-size: 10px;
+            font-family: inherit; cursor: pointer; text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }}
+        #layer-panel button:hover {{ border-color: #ef4444; color: #ef4444; }}
+        #conn-status {{
+            position: absolute; bottom: 8px; left: 8px; z-index: 999;
+            font-family: 'IBM Plex Mono', monospace; font-size: 9px;
+            font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+            padding: 2px 8px; border-radius: 3px;
+            background: rgba(17,19,24,0.85); border: 1px solid #1e2128;
+        }}
+        #gps-source {{
+            position: absolute; bottom: 8px; right: 8px; z-index: 999;
+            font-family: 'IBM Plex Mono', monospace; font-size: 9px;
+            font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+            padding: 2px 8px; border-radius: 3px;
+            background: rgba(17,19,24,0.85); border: 1px solid #1e2128;
+            color: #f97316;
+        }}
+    </style>
+    </head>
+    <body>
+    <div style="position:relative;">
+    <div id="map"></div>
+    <div id="layer-panel">
+        <div class="lp-title">Map Layers</div>
+        <label>
+            <input type="checkbox" id="tog-markings" checked onchange="toggleMarkings(this.checked)"/>
+            <span class="lp-indicator" style="background:#3b82f6;border-radius:50%;"></span>
+            Markings
+        </label>
+        <label>
+            <input type="checkbox" id="tog-signs" checked onchange="toggleSigns(this.checked)"/>
+            <span class="lp-indicator" style="background:#a855f7;"></span>
+            Signs
+        </label>
+        <button onclick="clearAllLayers()">Clear Map</button>
+    </div>
+    <div id="conn-status" style="color:#22c55e;">LIVE</div>
+    <div id="gps-source" style="color:#f97316;">GPS SIMULATED</div>
+    </div>
 
+    <script>
+    var GMAPS_API_KEY = '{_gmaps_key}';
+    // Derive API_BASE from the parent page's hostname so that smartphones
+    // on the same LAN can reach the sidecar.  components.html() iframes
+    // may have window.location = about:srcdoc, so we try parent first.
+    var _host = '127.0.0.1';
+    var _proto = 'http:';
+    try {{
+        if (window.parent && window.parent.location && window.parent.location.hostname) {{
+            _host = window.parent.location.hostname;
+            _proto = window.parent.location.protocol;
+        }}
+    }} catch(e) {{
+        // cross-origin — fall back to window.location
+        try {{
+            if (window.location.hostname) {{
+                _host = window.location.hostname;
+                _proto = window.location.protocol;
+            }}
+        }} catch(e2) {{}}
+    }}
+    // Ensure protocol is http/https, not about: or blob:
+    if (_proto !== 'http:' && _proto !== 'https:') {{ _proto = 'http:'; }}
+    var API_BASE = _proto + '//' + _host + ':{MAP_SERVER_PORT}';
+    var drawnMarkingIds = new Set();
+    var drawnSignIds = new Set();
+    var markingPolylines = [];
+    var markingDots = [];
+    var signMarkers = [];
+    var vehicleMarker = null;
+    var markingsVisible = true;
+    var signsVisible = true;
+    var lastPollOk = Date.now();
+
+    function toggleMarkings(show) {{
+        markingsVisible = show;
+        markingPolylines.forEach(function(p) {{ p.setMap(show ? window._gmap : null); }});
+        markingDots.forEach(function(m) {{ m.setMap(show ? window._gmap : null); }});
+    }}
+    function toggleSigns(show) {{
+        signsVisible = show;
+        signMarkers.forEach(function(m) {{ m.setMap(show ? window._gmap : null); }});
+    }}
+    function clearAllLayers() {{
+        markingPolylines.forEach(function(p) {{ p.setMap(null); }});
+        markingDots.forEach(function(m) {{ m.setMap(null); }});
+        signMarkers.forEach(function(m) {{ m.setMap(null); }});
+        markingPolylines = []; markingDots = []; signMarkers = [];
+        drawnMarkingIds.clear(); drawnSignIds.clear();
+        document.getElementById('tog-markings').checked = false;
+        document.getElementById('tog-signs').checked = false;
+    }}
+
+    function updateConnStatus() {{
+        var el = document.getElementById('conn-status');
+        var age = (Date.now() - lastPollOk) / 1000;
+        if (age < 2) {{ el.style.color = '#22c55e'; el.textContent = 'LIVE'; }}
+        else if (age < 5) {{ el.style.color = '#f97316'; el.textContent = 'STALE'; }}
+        else {{ el.style.color = '#ef4444'; el.textContent = 'DISCONNECTED'; }}
+    }}
+    setInterval(updateConnStatus, 1000);
+
+    // Smartphone GPS is handled by the dedicated sender page at
+    // http://<LAN-IP>:8503/gps — no geolocation in this iframe.
+
+    function pollAndUpdate() {{
+        if (!window._gmap) return;
+        var map = window._gmap;
+        fetch(API_BASE + '/api/state')
+        .then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+            lastPollOk = Date.now();
+            var v = data.vehicle;
+            if (vehicleMarker) {{
+                vehicleMarker.setPosition(new google.maps.LatLng(v.lat, v.lon));
+                // Visual distinction: full opacity for smartphone GPS, dimmed for simulated
+                vehicleMarker.setOpacity(v.gps_source === 'smartphone' ? 1.0 : 0.5);
+            }}
+            map.moveCamera({{ center: {{ lat: v.lat, lng: v.lon }}, heading: v.heading, tilt: 45 }});
+
+            // Update GPS source indicator (bottom-right)
+            var gpsEl = document.getElementById('gps-source');
+            if (gpsEl) {{
+                if (v.gps_source === 'smartphone') {{
+                    var acc = (v.gps_accuracy_m || 0).toFixed(0);
+                    gpsEl.style.color = '#22c55e';
+                    gpsEl.textContent = 'GPS LIVE \\u00b1' + acc + 'm';
+                }} else {{
+                    gpsEl.style.color = '#f97316';
+                    gpsEl.textContent = 'GPS SIMULATED';
+                }}
+            }}
+
+            var newMarkings = [];
+            (data.markings || []).forEach(function(m) {{
+                if (!drawnMarkingIds.has(m.id)) {{
+                    drawnMarkingIds.add(m.id);
+                    newMarkings.push(m);
+                    var marker = new google.maps.Marker({{
+                        position: {{ lat: m.lat, lng: m.lng }},
+                        map: markingsVisible ? map : null,
+                        icon: {{ path: google.maps.SymbolPath.CIRCLE, scale: 5,
+                                 fillColor: m.color, fillOpacity: 0.9,
+                                 strokeColor: '#fff', strokeWeight: 1 }},
+                    }});
+                    if (m.popup) {{
+                        var iw = new google.maps.InfoWindow({{
+                            content: '<div style="background:#111318;padding:8px;border-radius:4px;">' + m.popup + '</div>',
+                        }});
+                        marker.addListener('click', function() {{ iw.open(map, marker); }});
+                    }}
+                    markingDots.push(marker);
+                }}
+            }});
+
+            if (newMarkings.length >= 2) {{
+                var segments = [];
+                var seg = {{ path: [newMarkings[0]], color: newMarkings[0].color }};
+                for (var i = 1; i < newMarkings.length; i++) {{
+                    if (newMarkings[i].color === seg.color) {{ seg.path.push(newMarkings[i]); }}
+                    else {{ segments.push(seg); seg = {{ path: [newMarkings[i]], color: newMarkings[i].color }}; }}
+                }}
+                segments.push(seg);
+                segments.forEach(function(s) {{
+                    if (s.path.length >= 2) {{
+                        var polyline = new google.maps.Polyline({{
+                            path: s.path.map(function(p) {{ return {{ lat: p.lat, lng: p.lng }}; }}),
+                            geodesic: true, strokeColor: s.color,
+                            strokeOpacity: 0.85, strokeWeight: 5,
+                            map: markingsVisible ? map : null
+                        }});
+                        markingPolylines.push(polyline);
+                    }}
+                }});
+            }}
+
+            (data.signs || []).forEach(function(s) {{
+                if (!drawnSignIds.has(s.id)) {{
+                    drawnSignIds.add(s.id);
+                    var code = s.code || 'SG';
+                    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28">' +
+                        '<rect x="1" y="1" width="26" height="26" rx="3" fill="' + s.color + '" ' +
+                        'stroke="%23fff" stroke-width="1.5"/>' +
+                        '<text x="14" y="18" text-anchor="middle" font-family="monospace" ' +
+                        'font-size="11" font-weight="700" fill="%23fff">' + code + '</text></svg>';
+                    var iconUrl = 'data:image/svg+xml,' + encodeURIComponent(svg);
+                    var marker = new google.maps.Marker({{
+                        position: {{ lat: s.lat, lng: s.lng }},
+                        map: signsVisible ? map : null,
+                        icon: {{ url: iconUrl, scaledSize: new google.maps.Size(28, 28),
+                                 anchor: new google.maps.Point(14, 14) }},
+                        zIndex: 100,
+                    }});
+                    if (s.popup) {{
+                        var iw = new google.maps.InfoWindow({{
+                            content: '<div style="background:#111318;padding:8px;border-radius:4px;">' + s.popup + '</div>',
+                        }});
+                        marker.addListener('click', function() {{ iw.open(map, marker); }});
+                    }}
+                    signMarkers.push(marker);
+                }}
+            }});
+        }})
+        .catch(function(err) {{ }});
+    }}
+
+    function initGoogleMap() {{
+        var map = new google.maps.Map(document.getElementById('map'), {{
+            center: {{ lat: 28.6139, lng: 77.2090 }},
+            zoom: 18, mapTypeId: 'satellite', tilt: 45, heading: 45,
+            disableDefaultUI: true, zoomControl: true, rotateControl: true,
+            gestureHandling: 'greedy',
+            styles: [{{ featureType: 'all', elementType: 'labels', stylers: [{{ visibility: 'on' }}] }}]
+        }});
+        window._gmap = map;
+        vehicleMarker = new google.maps.Marker({{
+            position: {{ lat: 28.6139, lng: 77.2090 }}, map: map,
+            icon: {{ url: '{vehicle_icon_url}', scaledSize: new google.maps.Size(32, 32),
+                     anchor: new google.maps.Point(16, 16) }},
+            zIndex: 9999,
+        }});
+        setInterval(pollAndUpdate, 800);
+        pollAndUpdate();
+    }}
+
+    function initLeafletFallback() {{
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        document.head.appendChild(link);
+        var script = document.createElement('script');
+        script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        script.onload = function() {{
+            var map = L.map('map', {{
+                center: [28.6139, 77.2090], zoom: 18,
+                zoomControl: true, attributionControl: false
+            }});
+            window._lmap = map; window._gmap = null;
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+                maxZoom: 19,
+            }}).addTo(map);
+            var vehicleIcon = L.divIcon({{
+                className: '',
+                html: '<div style="width:20px;height:20px;background:#3b82f6;' +
+                      'border:3px solid #fff;border-radius:50%;' +
+                      'box-shadow:0 0 12px #3b82f6;"></div>',
+                iconSize: [20, 20], iconAnchor: [10, 10]
+            }});
+            window._lVehicle = L.marker([28.6139, 77.2090], {{ icon: vehicleIcon, zIndex: 9999 }}).addTo(map);
+
+            setInterval(function() {{
+                fetch(API_BASE + '/api/state')
+                .then(function(r) {{ return r.json(); }})
+                .then(function(data) {{
+                    lastPollOk = Date.now();
+                    var v = data.vehicle;
+                    if (window._lVehicle) {{
+                        window._lVehicle.setLatLng([v.lat, v.lon]);
+                        window._lVehicle.setOpacity(v.gps_source === 'smartphone' ? 1.0 : 0.5);
+                    }}
+                    map.panTo([v.lat, v.lon], {{ animate: true, duration: 0.5 }});
+
+                    // Update GPS source indicator (bottom-right)
+                    var gpsEl = document.getElementById('gps-source');
+                    if (gpsEl) {{
+                        if (v.gps_source === 'smartphone') {{
+                            var acc = (v.gps_accuracy_m || 0).toFixed(0);
+                            gpsEl.style.color = '#22c55e';
+                            gpsEl.textContent = 'GPS LIVE \\u00b1' + acc + 'm';
+                        }} else {{
+                            gpsEl.style.color = '#f97316';
+                            gpsEl.textContent = 'GPS SIMULATED';
+                        }}
+                    }}
+                    (data.markings || []).forEach(function(m) {{
+                        if (!drawnMarkingIds.has(m.id)) {{
+                            drawnMarkingIds.add(m.id);
+                            L.circleMarker([m.lat, m.lng], {{
+                                radius: 5, fillColor: m.color, color: '#fff',
+                                weight: 1, opacity: 0.9, fillOpacity: 0.85
+                            }}).bindPopup(m.popup || '', {{
+                                className: 'dark-popup', maxWidth: 220
+                            }}).addTo(map);
+                        }}
+                    }});
+                    (data.signs || []).forEach(function(s) {{
+                        if (!drawnSignIds.has(s.id)) {{
+                            drawnSignIds.add(s.id);
+                            var code = s.code || 'SG';
+                            var icon = L.divIcon({{
+                                className: '',
+                                html: '<div style="width:24px;height:24px;background:' + s.color +
+                                      ';border:2px solid #fff;border-radius:3px;display:flex;' +
+                                      'align-items:center;justify-content:center;font-family:monospace;' +
+                                      'font-size:10px;font-weight:700;color:#fff;">' + code + '</div>',
+                                iconSize: [24, 24], iconAnchor: [12, 12]
+                            }});
+                            L.marker([s.lat, s.lng], {{ icon: icon, zIndexOffset: 100 }})
+                             .bindPopup(s.popup || '', {{ className: 'dark-popup', maxWidth: 220 }})
+                             .addTo(map);
+                        }}
+                    }});
+                }})
+                .catch(function() {{}});
+            }}, 800);
+        }};
+        document.head.appendChild(script);
+        var popupStyle = document.createElement('style');
+        popupStyle.textContent = `
+            .dark-popup .leaflet-popup-content-wrapper {{
+                background: #111318 !important; color: #f1f5f9 !important;
+                border: 1px solid #1e2128 !important; border-radius: 6px !important;
+                font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+            }}
+            .dark-popup .leaflet-popup-tip {{ background: #111318 !important; }}
+        `;
+        document.head.appendChild(popupStyle);
+    }}
+
+    if (GMAPS_API_KEY && GMAPS_API_KEY !== 'YOUR_GOOGLE_MAPS_API_KEY') {{
+        var gscript = document.createElement('script');
+        gscript.src = 'https://maps.googleapis.com/maps/api/js?key=' + GMAPS_API_KEY + '&callback=initGoogleMap';
+        gscript.async = true; gscript.defer = true;
+        gscript.onerror = function() {{
+            console.warn('Google Maps failed, falling back to Leaflet satellite.');
+            initLeafletFallback();
+        }};
+        document.head.appendChild(gscript);
+    }} else {{
+        initLeafletFallback();
+    }}
+    </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=height + 10, scrolling=False)
+
+
+# ---------------------------------------------------------------------------
+# Push measurements to map sidecar
+# ---------------------------------------------------------------------------
+
+def _push_to_map_server(
+    measurements: List[dict],
+    vehicle_lat: float,
+    vehicle_lon: float,
+    vehicle_heading: float,
+) -> None:
+    """Push new measurements to the map sidecar (non-blocking).
+
+    Builds the marking/sign point dicts with popup HTML and calls
+    :func:`map_server.push_measurements` directly (same process,
+    no HTTP overhead).
+
+    Parameters
+    ----------
+    measurements : List[dict]
+        New measurement dicts to push (only the batch from this cycle).
+    vehicle_lat, vehicle_lon : float
+        Current vehicle position.
+    vehicle_heading : float
+        Current vehicle heading degrees.
+    """
     _sign_codes = {
         "traffic_sign_warning": "WR",
         "traffic_sign_mandatory": "MD",
@@ -630,7 +1044,10 @@ def _render_google_map(measurements: List[dict], center_lat: float,
         "gantry_sign": "GT",
     }
 
-    for m in pins:
+    new_markings: list = []
+    new_signs: list = []
+
+    for m in measurements:
         color = {"GREEN": "#22c55e", "AMBER": "#f97316", "RED": "#ef4444"}.get(
             m.get("status", "RED"), "#888"
         )
@@ -669,348 +1086,17 @@ def _render_google_map(measurements: List[dict], center_lat: float,
 
         if obj_type in ROAD_SIGN_CLASSES:
             point["code"] = _sign_codes.get(obj_type, "SG")
-            sign_points.append(point)
+            new_signs.append(point)
         else:
-            marking_points.append(point)
+            new_markings.append(point)
 
-    # Build JS arrays
-    markings_js = ",".join(
-        f'{{lat:{p["lat"]:.6f},lng:{p["lng"]:.6f},color:"{p["color"]}",'
-        f'popup:\'{p["popup"]}\',type:"{p["type"]}"}}'
-        for p in marking_points
+    _push_map(
+        vehicle_lat=vehicle_lat,
+        vehicle_lon=vehicle_lon,
+        vehicle_heading=vehicle_heading,
+        new_markings=new_markings,
+        new_signs=new_signs,
     )
-    signs_js = ",".join(
-        f'{{lat:{p["lat"]:.6f},lng:{p["lng"]:.6f},color:"{p["color"]}",'
-        f'popup:\'{p["popup"]}\',code:"{p["code"]}",type:"{p["type"]}"}}'
-        for p in sign_points
-    )
-
-    # Vehicle SVG icon
-    vehicle_svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">'
-        '<circle cx="16" cy="16" r="14" fill="%233b82f6" stroke="%23fff" stroke-width="2"/>'
-        '<polygon points="16,6 22,22 16,18 10,22" fill="%23fff"/>'
-        '</svg>'
-    )
-    vehicle_icon_url = f"data:image/svg+xml,{vehicle_svg}"
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <meta charset="utf-8"/>
-    <style>
-        body {{ margin:0; padding:0; background:#0a0c10; }}
-        #map {{ width:100%; height:{height}px; border-radius:6px;
-                border:1px solid #1e2128; }}
-        .gm-style-iw {{ background: #111318 !important; }}
-        .gm-style-iw-d {{ overflow: hidden !important; }}
-        .gm-ui-hover-effect {{ filter: invert(1); }}
-        /* Layer toggle panel */
-        #layer-panel {{
-            position: absolute; top: 10px; right: 10px; z-index: 999;
-            background: rgba(17,19,24,0.92); border: 1px solid #1e2128;
-            border-radius: 6px; padding: 10px 14px;
-            font-family: 'IBM Plex Mono', monospace; font-size: 11px;
-            color: #f1f5f9; min-width: 140px;
-            backdrop-filter: blur(8px);
-        }}
-        #layer-panel .lp-title {{
-            font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em;
-            color: #6b7280; margin-bottom: 8px;
-        }}
-        #layer-panel label {{
-            display: flex; align-items: center; gap: 8px;
-            cursor: pointer; padding: 3px 0; color: #e2e8f0;
-        }}
-        #layer-panel label:hover {{ color: #fff; }}
-        #layer-panel input[type="checkbox"] {{
-            accent-color: #3b82f6; width: 14px; height: 14px;
-        }}
-        #layer-panel .lp-indicator {{
-            display: inline-block; width: 10px; height: 10px;
-            border-radius: 2px; margin-right: 2px;
-        }}
-        #layer-panel button {{
-            margin-top: 8px; width: 100%; padding: 4px 0;
-            background: #1e2128; border: 1px solid #2a2d36;
-            border-radius: 4px; color: #6b7280; font-size: 10px;
-            font-family: inherit; cursor: pointer; text-transform: uppercase;
-            letter-spacing: 0.06em;
-        }}
-        #layer-panel button:hover {{ border-color: #ef4444; color: #ef4444; }}
-    </style>
-    </head>
-    <body>
-    <div style="position:relative;">
-    <div id="map"></div>
-    <div id="layer-panel">
-        <div class="lp-title">Map Layers</div>
-        <label>
-            <input type="checkbox" id="tog-markings" checked onchange="toggleMarkings(this.checked)"/>
-            <span class="lp-indicator" style="background:#3b82f6;border-radius:50%;"></span>
-            Markings
-        </label>
-        <label>
-            <input type="checkbox" id="tog-signs" checked onchange="toggleSigns(this.checked)"/>
-            <span class="lp-indicator" style="background:#a855f7;"></span>
-            Signs
-        </label>
-        <button onclick="clearAllLayers()">Clear Map</button>
-    </div>
-    </div>
-
-    <script>
-    var GMAPS_API_KEY = '{_gmaps_key}';
-    var CENTER = {{ lat: {center_lat}, lng: {center_lon} }};
-    var HEADING = {heading};
-    var MARKINGS = [{markings_js}];
-    var SIGNS = [{signs_js}];
-
-    var markingPolylines = [];
-    var markingDots = [];
-    var signMarkers = [];
-    var markingsVisible = true;
-    var signsVisible = true;
-
-    function toggleMarkings(show) {{
-        markingsVisible = show;
-        markingPolylines.forEach(function(p) {{ p.setMap(show ? window._gmap : null); }});
-        markingDots.forEach(function(m) {{ m.setMap(show ? window._gmap : null); }});
-    }}
-    function toggleSigns(show) {{
-        signsVisible = show;
-        signMarkers.forEach(function(m) {{ m.setMap(show ? window._gmap : null); }});
-    }}
-    function clearAllLayers() {{
-        markingPolylines.forEach(function(p) {{ p.setMap(null); }});
-        markingDots.forEach(function(m) {{ m.setMap(null); }});
-        signMarkers.forEach(function(m) {{ m.setMap(null); }});
-        markingPolylines = []; markingDots = []; signMarkers = [];
-        document.getElementById('tog-markings').checked = false;
-        document.getElementById('tog-signs').checked = false;
-    }}
-
-    function initGoogleMap() {{
-        var map = new google.maps.Map(document.getElementById('map'), {{
-            center: CENTER,
-            zoom: 18,
-            mapTypeId: 'satellite',
-            tilt: 45,
-            heading: HEADING,
-            disableDefaultUI: true,
-            zoomControl: true,
-            rotateControl: true,
-            gestureHandling: 'greedy',
-            styles: [{{ featureType: 'all', elementType: 'labels', stylers: [{{ visibility: 'on' }}] }}]
-        }});
-        window._gmap = map;
-
-        // --- Road marking polylines ---
-        // Group consecutive marking points and draw polylines with status color
-        if (MARKINGS.length > 1) {{
-            var segments = [];
-            var seg = {{ path: [MARKINGS[0]], color: MARKINGS[0].color }};
-            for (var i = 1; i < MARKINGS.length; i++) {{
-                if (MARKINGS[i].color === seg.color) {{
-                    seg.path.push(MARKINGS[i]);
-                }} else {{
-                    segments.push(seg);
-                    seg = {{ path: [MARKINGS[i]], color: MARKINGS[i].color }};
-                }}
-            }}
-            segments.push(seg);
-
-            segments.forEach(function(s) {{
-                if (s.path.length >= 2) {{
-                    var polyline = new google.maps.Polyline({{
-                        path: s.path.map(function(p) {{ return {{lat: p.lat, lng: p.lng}}; }}),
-                        geodesic: true,
-                        strokeColor: s.color,
-                        strokeOpacity: 0.85,
-                        strokeWeight: 5,
-                        map: map
-                    }});
-                    markingPolylines.push(polyline);
-                }}
-            }});
-        }}
-
-        // Marking dots (small circles at each measurement point)
-        MARKINGS.forEach(function(m) {{
-            var marker = new google.maps.Marker({{
-                position: {{ lat: m.lat, lng: m.lng }},
-                map: map,
-                icon: {{
-                    path: google.maps.SymbolPath.CIRCLE,
-                    scale: 5,
-                    fillColor: m.color,
-                    fillOpacity: 0.9,
-                    strokeColor: '#fff',
-                    strokeWeight: 1,
-                }},
-            }});
-            var iw = new google.maps.InfoWindow({{
-                content: '<div style="background:#111318;padding:8px;border-radius:4px;">' +
-                         m.popup + '</div>',
-            }});
-            marker.addListener('click', function() {{ iw.open(map, marker); }});
-            markingDots.push(marker);
-        }});
-
-        // --- Sign square markers ---
-        SIGNS.forEach(function(s) {{
-            // Custom square SVG marker with 2-letter code
-            var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28">' +
-                '<rect x="1" y="1" width="26" height="26" rx="3" fill="' + s.color + '" ' +
-                'stroke="%23fff" stroke-width="1.5"/>' +
-                '<text x="14" y="18" text-anchor="middle" font-family="monospace" ' +
-                'font-size="11" font-weight="700" fill="%23fff">' + s.code + '</text></svg>';
-            var iconUrl = 'data:image/svg+xml,' + encodeURIComponent(svg);
-
-            var marker = new google.maps.Marker({{
-                position: {{ lat: s.lat, lng: s.lng }},
-                map: map,
-                icon: {{
-                    url: iconUrl,
-                    scaledSize: new google.maps.Size(28, 28),
-                    anchor: new google.maps.Point(14, 14),
-                }},
-                zIndex: 100,
-            }});
-            var iw = new google.maps.InfoWindow({{
-                content: '<div style="background:#111318;padding:8px;border-radius:4px;">' +
-                         s.popup + '</div>',
-            }});
-            marker.addListener('click', function() {{ iw.open(map, marker); }});
-            signMarkers.push(marker);
-        }});
-
-        // Vehicle marker
-        new google.maps.Marker({{
-            position: CENTER,
-            map: map,
-            icon: {{
-                url: '{vehicle_icon_url}',
-                scaledSize: new google.maps.Size(32, 32),
-                anchor: new google.maps.Point(16, 16),
-            }},
-            zIndex: 9999,
-        }});
-    }}
-
-    function initLeafletFallback() {{
-        var link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-        document.head.appendChild(link);
-
-        var script = document.createElement('script');
-        script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-        script.onload = function() {{
-            var map = L.map('map', {{
-                center: [{center_lat}, {center_lon}],
-                zoom: 18,
-                zoomControl: true,
-                attributionControl: false
-            }});
-            window._gmap = null;
-
-            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
-                maxZoom: 19,
-            }}).addTo(map);
-
-            // Marking polylines (Leaflet)
-            if (MARKINGS.length >= 2) {{
-                var segments = [];
-                var seg = {{ path: [MARKINGS[0]], color: MARKINGS[0].color }};
-                for (var i = 1; i < MARKINGS.length; i++) {{
-                    if (MARKINGS[i].color === seg.color) {{
-                        seg.path.push(MARKINGS[i]);
-                    }} else {{
-                        segments.push(seg);
-                        seg = {{ path: [MARKINGS[i]], color: MARKINGS[i].color }};
-                    }}
-                }}
-                segments.push(seg);
-                segments.forEach(function(s) {{
-                    if (s.path.length >= 2) {{
-                        L.polyline(s.path.map(function(p) {{ return [p.lat, p.lng]; }}), {{
-                            color: s.color, weight: 5, opacity: 0.85
-                        }}).addTo(map);
-                    }}
-                }});
-            }}
-
-            // Marking dots
-            MARKINGS.forEach(function(m) {{
-                L.circleMarker([m.lat, m.lng], {{
-                    radius: 5, fillColor: m.color, color: '#fff',
-                    weight: 1, opacity: 0.9, fillOpacity: 0.85
-                }}).bindPopup(m.popup, {{
-                    className: 'dark-popup', maxWidth: 220
-                }}).addTo(map);
-            }});
-
-            // Sign square markers (Leaflet DivIcon)
-            SIGNS.forEach(function(s) {{
-                var icon = L.divIcon({{
-                    className: '',
-                    html: '<div style="width:24px;height:24px;background:' + s.color +
-                          ';border:2px solid #fff;border-radius:3px;display:flex;' +
-                          'align-items:center;justify-content:center;font-family:monospace;' +
-                          'font-size:10px;font-weight:700;color:#fff;">' + s.code + '</div>',
-                    iconSize: [24, 24],
-                    iconAnchor: [12, 12]
-                }});
-                L.marker([s.lat, s.lng], {{ icon: icon, zIndexOffset: 100 }})
-                 .bindPopup(s.popup, {{ className: 'dark-popup', maxWidth: 220 }})
-                 .addTo(map);
-            }});
-
-            // Vehicle
-            var vehicleIcon = L.divIcon({{
-                className: '',
-                html: '<div style="width:20px;height:20px;background:#3b82f6;' +
-                      'border:3px solid #fff;border-radius:50%;' +
-                      'box-shadow:0 0 12px #3b82f6;"></div>',
-                iconSize: [20, 20],
-                iconAnchor: [10, 10]
-            }});
-            L.marker([{center_lat}, {center_lon}], {{ icon: vehicleIcon, zIndex: 9999 }}).addTo(map);
-        }};
-        document.head.appendChild(script);
-
-        var popupStyle = document.createElement('style');
-        popupStyle.textContent = `
-            .dark-popup .leaflet-popup-content-wrapper {{
-                background: #111318 !important; color: #f1f5f9 !important;
-                border: 1px solid #1e2128 !important; border-radius: 6px !important;
-                font-family: 'IBM Plex Mono', monospace; font-size: 12px;
-            }}
-            .dark-popup .leaflet-popup-tip {{ background: #111318 !important; }}
-        `;
-        document.head.appendChild(popupStyle);
-    }}
-
-    if (GMAPS_API_KEY && GMAPS_API_KEY !== 'YOUR_GOOGLE_MAPS_API_KEY') {{
-        var gscript = document.createElement('script');
-        gscript.src = 'https://maps.googleapis.com/maps/api/js?key=' + GMAPS_API_KEY + '&callback=initGoogleMap';
-        gscript.async = true;
-        gscript.defer = true;
-        gscript.onerror = function() {{
-            console.warn('Google Maps failed, falling back to Leaflet satellite.');
-            initLeafletFallback();
-        }};
-        document.head.appendChild(gscript);
-    }} else {{
-        initLeafletFallback();
-    }}
-    </script>
-    </body>
-    </html>
-    """
-    components.html(html, height=height + 10, scrolling=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1188,7 @@ def main() -> None:
     heading: float = st.session_state.gps_heading
     num_markings: int = 0
     num_signs: int = 0
+    _smartphone_gps_active: bool = False   # set True when phone GPS overrides
 
     if st.session_state.simulate:
         now = time.time()
@@ -1122,6 +1209,14 @@ def main() -> None:
             gps_lat = st.session_state.gps_lat
             gps_lon = st.session_state.gps_lon
             heading = st.session_state.gps_heading
+
+            # Override with smartphone GPS if active
+            _phone = _get_smartphone_gps()
+            if _phone is not None:
+                gps_lat = _phone["lat"]
+                gps_lon = _phone["lon"]
+                heading = _phone["heading"]
+                _smartphone_gps_active = True
 
             sensor_snap = {
                 "temperature_c": round(random.uniform(22, 38), 1),
@@ -1147,6 +1242,10 @@ def main() -> None:
                     humidity_pct=m["humidity_pct"], distance_cm=m["distance_cm"],
                     tilt_deg=m["tilt_deg"],
                 )
+            # Push this cycle's measurements to the map sidecar
+            _batch = st.session_state.measurements[-len(current_dets):]
+            if _batch:
+                _push_to_map_server(_batch, gps_lat, gps_lon, heading)
             if len(st.session_state.measurements) > 500:
                 st.session_state.measurements = st.session_state.measurements[-500:]
             st.session_state.last_sim_time = now
@@ -1171,6 +1270,15 @@ def main() -> None:
             gps = snap.get("gps", (28.6139, 77.2090))
             gps_lat, gps_lon = gps[0], gps[1]
             heading = sensor_snap.get("yaw_deg", st.session_state.gps_heading)
+
+            # Override with smartphone GPS if active
+            _phone = _get_smartphone_gps()
+            if _phone is not None:
+                gps_lat = _phone["lat"]
+                gps_lon = _phone["lon"]
+                heading = _phone["heading"]
+                _smartphone_gps_active = True
+
             for dd in snap.get("detection_details", []):
                 current_dets.append({
                     "cls_name": dd.class_name, "confidence": dd.confidence,
@@ -1201,6 +1309,10 @@ def main() -> None:
                     distance_cm=m["distance_cm"],
                     tilt_deg=m["tilt_deg"],
                 )
+            # Push this cycle's measurements to the map sidecar
+            _batch = st.session_state.measurements[-len(current_dets):]
+            if _batch:
+                _push_to_map_server(_batch, gps_lat, gps_lon, heading)
             if len(st.session_state.measurements) > 500:
                 st.session_state.measurements = st.session_state.measurements[-500:]
 
@@ -1225,6 +1337,19 @@ def main() -> None:
     _cam_ok = os.path.exists(f"/dev/video{CAMERA_INDEX}") or st.session_state.simulate
     _sens_ok = True  # Sensors always have fallback
 
+    # GPS source from sidecar state (for top-bar indicator)
+    _map_state = _get_map_state()
+    _gps_src = _map_state["vehicle"].get("gps_source", "simulated")
+    _gps_acc = _map_state["vehicle"].get("gps_accuracy_m", 0.0)
+    if _gps_src == "smartphone":
+        _gps_label = f'GPS LIVE &plusmn;{_gps_acc:.0f}m'
+        _gps_color = "var(--green)"
+        _gps_dot = "dot-ok"
+    else:
+        _gps_label = "GPS SIMULATED"
+        _gps_color = "var(--amber)"
+        _gps_dot = "dot-warn"
+
     # ================================================================
     # TOP BAR
     # ================================================================
@@ -1240,6 +1365,9 @@ def main() -> None:
         f'<span>SIGNS <span class="tv">{num_signs}</span></span>'
         f'<div class="topbar-divider"></div>'
         f'<span>COMPLIANCE <span class="tv">{compliance_pct:.0f}%</span></span>'
+        f'<div class="topbar-divider"></div>'
+        f'<span style="color:{_gps_color};font-size:10px;font-weight:700;'
+        f'letter-spacing:0.06em;">{_gps_label}</span>'
         f'<div class="topbar-divider"></div>'
         f'<span class="status-dot {"dot-ok" if _cam_ok else "dot-off"}" '
         f'title="Camera"></span>'
@@ -1270,7 +1398,12 @@ def main() -> None:
         st.markdown('<p class="slabel">Camera Feed</p>', unsafe_allow_html=True)
         if frame_bgr is not None:
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            st.image(frame_rgb, width="stretch")
+            _, _jpg_buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _b64_frame = base64.b64encode(_jpg_buf.tobytes()).decode()
+            st.markdown(
+                f'<img src="data:image/jpeg;base64,{_b64_frame}" '
+                f'style="width:100%;border-radius:6px;border:1px solid #1e2128;"/>',
+                unsafe_allow_html=True)
         else:
             st.markdown(
                 '<div style="background:#111318;border:1px solid #1e2128;'
@@ -1379,21 +1512,10 @@ def main() -> None:
     # ================================================================
     st.markdown('<p class="slabel" style="margin-top:14px;">GPS Driving Map</p>',
                 unsafe_allow_html=True)
-    if measurements:
-        _render_google_map(
-            measurements,
-            center_lat=gps_lat,
-            center_lon=gps_lon,
-            heading=heading,
-            height=420,
-        )
-    else:
-        st.markdown(
-            '<div style="background:#111318;border:1px solid #1e2128;'
-            'border-radius:6px;padding:40px;text-align:center;'
-            'color:#6b7280;font-family:var(--font-mono);font-size:12px;">'
-            'No GPS data yet -- measurements will appear as pins on the map'
-            '</div>', unsafe_allow_html=True)
+    # Render-once: the iframe polls the map sidecar for updates.
+    # Since the HTML is data-free (static), Streamlit reuses the same
+    # iframe across reruns — no flicker, no map re-init.
+    _render_google_map_static(height=420)
 
     # ================================================================
     # ROW 3 — Measurements Table (full width, filterable)
@@ -1427,11 +1549,15 @@ def main() -> None:
                 st.success(f"Exported {count} records to {path.name}")
         with bc2:
             if measurements:
-                df_exp = pd.DataFrame(measurements)
-                csv_bytes = df_exp.to_csv(index=False).encode()
+                # Cache CSV bytes so the hash stays stable across reruns
+                _now_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                _csv_key = f"_dl_csv_{_now_tag}"
+                if _csv_key not in st.session_state or len(measurements) != st.session_state.get("_dl_csv_len", -1):
+                    st.session_state[_csv_key] = pd.DataFrame(measurements).to_csv(index=False).encode()
+                    st.session_state["_dl_csv_len"] = len(measurements)
                 st.download_button(
-                    "Download", data=csv_bytes,
-                    file_name=f"highway_retro_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv",
+                    "Download", data=st.session_state[_csv_key],
+                    file_name=f"highway_retro_{_now_tag}.csv",
                     mime="text/csv", use_container_width=True,
                 )
 
@@ -1599,14 +1725,19 @@ def main() -> None:
             st.session_state.measurements = []
             st.session_state.exporter.clear()
             st.session_state.session_start = time.time()
+            _clear_map()
             st.rerun()
 
         if measurements:
-            df_sidebar = pd.DataFrame(measurements)
-            csv_sidebar = df_sidebar.to_csv(index=False).encode()
+            # Cache sidebar CSV so media hash stays stable across rapid reruns
+            _sb_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+            _sb_key = f"_sb_csv_{_sb_tag}"
+            if _sb_key not in st.session_state or len(measurements) != st.session_state.get("_sb_csv_len", -1):
+                st.session_state[_sb_key] = pd.DataFrame(measurements).to_csv(index=False).encode()
+                st.session_state["_sb_csv_len"] = len(measurements)
             st.download_button(
-                "Export Session CSV", data=csv_sidebar,
-                file_name=f"session_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv",
+                "Export Session CSV", data=st.session_state[_sb_key],
+                file_name=f"session_{_sb_tag}.csv",
                 mime="text/csv", use_container_width=True, key="sidebar_export",
             )
 
