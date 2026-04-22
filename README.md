@@ -1,8 +1,13 @@
 # HighwayRetroAI 🛣️
-
 **Real-Time Retroreflectivity Measurement System for Indian Highways**
 
 > NHAI 6th Innovation Hackathon — Submission by Team HighwayRetroAI
+
+---
+
+## 📺 Demo Video
+
+[![HighwayRetroAI Demo](https://img.youtube.com/vi/IoAWy9BDnqg/maxresdefault.jpg)](https://youtu.be/IoAWy9BDnqg)
 
 ---
 
